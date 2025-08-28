@@ -38,6 +38,10 @@ class TrainingConfig:
         self.min_delta     = float(cfg['min_delta'])
         self.task          = cfg['task']
         self.state_filter  = cfg.get('state_filter', None)
+        self.train_file_dir = cfg.get('train_file_dir', self.train_file_dir)
+        self.valid_file_dir = cfg.get('valid_file_dir', self.valid_file_dir)
+        self.train_img_dir  = cfg.get('train_img_dir',  self.train_img_dir)
+        self.valid_img_dir  = cfg.get('valid_img_dir',  self.valid_img_dir)
 
         # ----- NEW regularization params -----
         self.dropout_rate    = float(cfg.get('dropout_rate', 0.0))
@@ -47,25 +51,44 @@ class TrainingConfig:
         self.drop_path_rate  = float(cfg.get('drop_path_rate', 0.0))
         self.max_norm        = float(cfg.get('max_norm', 0.0))
 
-        self.LOSS = dict(
-            name="focal",              # ["ce", "weighted_ce", "focal", "multitask"]
-            apply_class_balance=False,  # True なら有効サンプル数に基づく重みを計算
-            focal_gamma=2.0,        # FocalLoss 用
-            label_smoothing=0.0,    # PyTorch >=1.10 の CrossEntropyLoss でサポート
-            beta=0.9999,            # 有効サンプル数 (CB-Loss) の β
-            alpha=1.0,              # multitask の重み
-            beta_mse=1.0,           # multitask の MSE 側重み
+        _loss_default = dict(
+            name="focal",
+            apply_class_balance=False,
+            focal_gamma=2.0,
+            label_smoothing=0.0,
+            beta=0.9999,
+            alpha=1.0,
+            beta_mse=1.0,
         )
+        _loss_default.update(cfg.get('LOSS', {}))
+        self.LOSS = _loss_default
 
-        self.AUGMENTATION = dict(
-            name="cutmix",          # "none" | "cutmix" | "attentive_cutmix" |
-                                    # "saliencymix" | "puzzlemix" | "snapmix" | "keepaugment"
-            prob=1.0,               # 0.0–1.0 で実行確率
-            beta=1.0,               # CutMix/Saliency 系の Beta 分布 α
-            use_cam_backbone="resnet50",   # Attentive／SnapMix 用 – CAM を取る骨格
-            saliency_method="grad",        # SaliencyMix／PuzzleMix 用 – "grad" | "smoothgrad"
-            keepaugment_tau=0.15,          # KeepAugment の重要領域しきい値
+        # 既存の self.AUGMENTATION = dict(...) を以下に置き換え
+        _aug_default = dict(
+            name="cutmix",                 # "none"|"cutmix"|...|"signalmix"
+            prob=1.0,
+            beta=1.0,
+            use_cam_backbone="resnet50",
+            saliency_method="grad",
+            keepaugment_tau=0.15,
         )
+        _aug_default.update(cfg.get('AUGMENTATION', {}))
+
+        # SignalMix を選んだときの既定値を補完（YAML未記載でも動くように）
+        if str(_aug_default.get('name', '')).lower() == 'signalmix':
+            _aug_default.setdefault('signal_dir',  r'D:\Datasets\WithCross Dataset\vidvip_signal/signal')
+            _aug_default.setdefault('signal_csv',  r'D:\Datasets\WithCross Dataset\vidvip_signal/signal.csv')
+            _aug_default.setdefault('none_index',  0)
+            _aug_default.setdefault('use_cutmix',  True)
+
+        self.AUGMENTATION = _aug_default
+
+        # ★ 追加: wandb のプロジェクト名 / run の接頭語
+        self.wandb_project = override.get('wandb_project', base_cfg.get('wandb_project', 'withcross-training'))
+        self.run_prefix    = override.get('run_prefix',    base_cfg.get('run_prefix',    'run'))
+
+        # ★ 追加（任意）: YAMLパスも保持しておくとログで便利
+        self.config_path   = base_cfg.get('__yaml_path__', '')
 
 def load_all_training_configs(yaml_path: str):
     """Load YAML and create TrainingConfig for every model entry."""
@@ -74,6 +97,15 @@ def load_all_training_configs(yaml_path: str):
 
     common = {k: v for k, v in exp.items() if k != 'models'}
     items  = exp['models']
+
+    # ★ 追加: YAMLパスと YAMLファイル名(stem)を共通設定に埋め込む
+    common['__yaml_path__'] = yaml_path
+    try:
+        import os
+        common.setdefault('run_prefix', os.path.splitext(os.path.basename(yaml_path))[0])
+    except Exception:
+        common.setdefault('run_prefix', 'run')
+
 
     configs = []
     if isinstance(items, list):

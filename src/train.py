@@ -19,7 +19,7 @@ if __name__ == "__main__":
     # DDP rendezvous 環境変数を“親プロセスで一度だけ”設定
     # -------------------------------------------------
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "29500"   # ← launcher.py と同じで OK
+    os.environ["MASTER_PORT"] = "29501"   # ← launcher.py と同じで OK
 
     world_size = torch.cuda.device_count() or 1
     mp.set_start_method("spawn", force=True)

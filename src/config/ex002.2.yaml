@@ -22,9 +22,9 @@ experiment:
 
   AUGMENTATION:
     name: signalmix # none | signalmix
-    prob: 0.7
-    use_cutmix: true
-    cutmix_prob: 0.5
+    prob: 0.5
+    use_cutmix: false
+    cutmix_prob: 0.0
     beta: 1.0
     min_lam: 0.35
     max_lam: 0.65

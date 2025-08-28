@@ -1,3 +1,4 @@
+import torchvision.transforms.functional as TF
 
 import csv
 from collections import defaultdict
@@ -8,6 +9,7 @@ from typing import Tuple, Dict, List, Optional
 from pathlib import Path
 from PIL import Image
 import torchvision.transforms.functional as T
+
 
 __all__ = [
     "CutMix", "AttentiveCutMix", "SaliencyMix",
@@ -30,6 +32,33 @@ def _rand_bbox(W: int, H: int, lam: float) -> Tuple[int, int, int, int]:
     y2 = int(torch.clamp(torch.tensor(cy + cut_h // 2), 0, H))
     return x1, y1, x2, y2
 
+def _rand_bbox_wh(W: int, H: int, lam: float,
+                  min_lam: float = 0.3, max_lam: float = 0.7) -> Tuple[int,int,int,int]:
+    lam = float(max(min(lam, max_lam), min_lam))
+    cut_rat = (1.0 - lam) ** 0.5
+    cut_w = max(1, int(W * cut_rat))
+    cut_h = max(1, int(H * cut_rat))
+    cx = random.randint(0, W - 1)
+    cy = random.randint(0, H - 1)
+    x1 = int(max(0, cx - cut_w // 2)); x2 = int(min(W, cx + cut_w // 2))
+    y1 = int(max(0, cy - cut_h // 2)); y2 = int(min(H, cy + cut_h // 2))
+    if x2 <= x1: x2 = min(W, x1 + 1)
+    if y2 <= y1: y2 = min(H, y1 + 1)
+    return x1, y1, x2, y2
+
+
+def _rect_overlap(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> bool:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    return not (ax2 <= bx1 or bx2 <= ax1 or ay2 <= by1 or by2 <= ay1)
+
+
+def _any_overlap(rect: Tuple[int,int,int,int], boxes: List[Tuple[int,int,int,int]]) -> bool:
+    for bx in boxes:
+        if _rect_overlap(rect, bx):
+            return True
+    return False
+
 # ------------------------------------------------------------------------- #
 # 1. CutMix（ベースライン）
 # ------------------------------------------------------------------------- #
@@ -37,17 +66,26 @@ class CutMix:
     def __init__(self, beta: float = 1.0):
         self.beta = beta
 
-    def __call__(self, x, y):
-        lam = torch.distributions.Beta(self.beta, self.beta).sample().item()
+    def __call__(self, x: torch.Tensor, y: torch.Tensor):
+        """
+        x: (B,3,H,W), y: (B,C) or (B,)
+        ※ “コピー元は clone() から読む” ことで伝播混入を防ぐ
+        """
         B, _, H, W = x.size()
+        if B < 2:                         # 1枚だけなら何もしない
+            return x, y
+        lam = torch.distributions.Beta(self.beta, self.beta).sample().item()
         idx = torch.randperm(B, device=x.device)
-        x1, y1, x2, y2 = _rand_bbox(W, H, lam)
-        x[:, :, y1:y2, x1:x2] = x[idx, :, y1:y2, x1:x2]
-        lam = 1 - (x2 - x1) * (y2 - y1) / (W * H)
+        x1, y1, x2, y2 = _rand_bbox_wh(W, H, lam, 0.3, 0.7)
+
+        src = x.clone()                   # ← 重要：コピー元のスナップショット
+        x[:, :, y1:y2, x1:x2] = src[idx, :, y1:y2, x1:x2]
+
+        lam_adj = 1 - (x2 - x1) * (y2 - y1) / (W * H)
         if y.dim() == 2:
-            y = lam * y + (1 - lam) * y[idx]
+            y = lam_adj * y + (1 - lam_adj) * y[idx]
         else:
-            y = y[idx]                           # hard‐label の場合は置換
+            y = y[idx]
         return x, y
 
 # ------------------------------------------------------------------------- #
@@ -351,87 +389,208 @@ class KeepAugment(CutMix):
 # ------------------------------------------------------------------------- #
 class SignalMix:
     """
-    src 画像に信号があるとき、その bbox へ `signal_dir` の
-    別画像を 1 枚貼り付け、**signal 画像側のラベルで labels を更新** する。
+    SignalMix:
+      1) （任意）CutMix
+         - 矩形は *dst* と *src* の両方の signal bbox を避けて選ぶ
+         - さらに CutMix 後に dst の signal 中心半径 r を元画素で復元（保護）
+      2) signal crops を dst の signal bbox へ貼付
+      3) ラベルは signal.csv の 0/1 → {1:RED, 2:GREEN} に上書き
+
+    cfg 主要パラメータ:
+      mix_prob, use_cutmix, cutmix_prob, beta, min_lam, max_lam,
+      protect_radius, max_trials, none_index,
+      signal_dir, signal_csv
     """
+    needs_bboxes = True  # visualize/train 側で bbox を渡すトリガー
 
     def __init__(self,
                  signal_dir: str | Path,
-                 csv_path: str | Path = r"D:\Datasets\WithCross Dataset\signal.csv",
-                 mix_prob: float = 0.5):
-        self.mix_prob = mix_prob
+                 csv_path: str | Path,
+                 mix_prob: float = 0.5,
+                 use_cutmix: bool = True,
+                 cutmix_prob: float = 1.0,
+                 beta: float = 1.0,
+                 min_lam: float = 0.3,
+                 max_lam: float = 0.7,
+                 protect_radius: int = 50,
+                 max_trials: int = 25,
+                 none_index: int = 0):
+        self.mix_prob = float(mix_prob)
+        self.use_cutmix = bool(use_cutmix)
+        self.cutmix_prob = float(cutmix_prob)
+        self.beta = float(beta)
+        self.min_lam = float(min_lam)
+        self.max_lam = float(max_lam)
+        self.protect_radius = int(protect_radius)
+        self.max_trials = int(max_trials)
+        self.none_index = int(none_index)
 
-        # --- ① signal 画像バッファ ---
+        # signal crops を読み込み（0..1, CHW）
         self.signal_buf: Dict[str, torch.Tensor] = {}
         for p in sorted(Path(signal_dir).glob("*.[jp][pn]g")):
-            self.signal_buf[p.name] = T.to_tensor(Image.open(p).convert("RGB"))
-
+            self.signal_buf[p.name] = TF.to_tensor(Image.open(p).convert("RGB"))
         if not self.signal_buf:
             raise FileNotFoundError(f"No images found in {signal_dir}")
 
-        # --- ② {filename -> label} を csv から読み込む ---
+        # signal.csv: {signal_file -> 0/1}
         self.sig_label: Dict[str, int] = {}
-        with open(csv_path, newline="") as f:
+        with open(csv_path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 self.sig_label[row["signal_file"]] = int(row["label"])
-
         if not self.sig_label:
             raise FileNotFoundError(f"No valid entries in {csv_path}")
 
-        # one-hot 用にクラス数を推定（0-origin を想定）
-        self.num_classes = max(self.sig_label.values()) + 1
+        # 0/1 -> {1:RED, 2:GREEN}
+        self.sig_to_train = {0: 1, 1: 2}
 
-    # ------------------------------------------------------------------ #
-    def __call__(self,
-                 imgs: torch.Tensor,                     # (B,3,H,W)
-                 labels: torch.Tensor,                   # hard or one-hot
-                 signal_bboxes: Optional[List[List[Tuple[int,int,int,int]]]] = None
-                 ):
-        if (
-            signal_bboxes is None
-            or all(len(b) == 0 for b in signal_bboxes)
-            or random.random() > self.mix_prob
-        ):
-            return imgs, labels  # 何もせず返す
+        # 可視化用: 直近の CutMix 矩形（各サンプル）
+        self.last_cutmix_boxes: Optional[List[Tuple[int,int,int,int]]] = None
 
-        B, _, H, W = imgs.shape
-        device = imgs.device
+    @staticmethod
+    def _resize_tensor(img_chw: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
+        return F.interpolate(img_chw.unsqueeze(0), size=(out_h, out_w),
+                             mode="bilinear", align_corners=False).squeeze(0)
+
+    def _centers_from_bboxes(self, bxs: List[Tuple[int,int,int,int]]) -> List[Tuple[int,int]]:
+        cs = []
+        for (x1, y1, x2, y2) in bxs:
+            cs.append(((x1 + x2) // 2, (y1 + y2) // 2))
+        return cs
+
+    def _protect_dst_centers(self, imgs: torch.Tensor,
+                             before: torch.Tensor,
+                             bboxes_batch: List[List[Tuple[int,int,int,int]]]) -> None:
+        """
+        CutMix 後に、dst 側の signal 中心（半径 protect_radius）を before の画素で復元
+        """
+        if self.protect_radius <= 0:
+            return
+        B, C, H, W = imgs.shape
+        r2 = self.protect_radius * self.protect_radius
+        for i in range(B):
+            cs = self._centers_from_bboxes(bboxes_batch[i])
+            if not cs:
+                continue
+            for (cx, cy) in cs:
+                x0 = max(0, cx - self.protect_radius)
+                y0 = max(0, cy - self.protect_radius)
+                x1 = min(W, cx + self.protect_radius)
+                y1 = min(H, cy + self.protect_radius)
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                yy = torch.arange(y0, y1, device=imgs.device) - cy
+                xx = torch.arange(x0, x1, device=imgs.device) - cx
+                Y, X = torch.meshgrid(yy, xx, indexing='ij')
+                mask = (X*X + Y*Y) <= r2  # (h,w) bool
+                # 画素復元（元の dst を優先）
+                patch = imgs[i, :, y0:y1, x0:x1]
+                patch0 = before[i, :, y0:y1, x0:x1]
+                patch[:, mask] = patch0[:, mask]
+
+    def _maybe_cutmix(self,
+                      imgs: torch.Tensor,
+                      bboxes_batch: Optional[List[List[Tuple[int,int,int,int]]]]) -> torch.Tensor:
+        """
+        CutMix:
+          - 画像クローン src をコピー元に使用して“連鎖混入”を防止
+          - 矩形は dst と src の signal bbox のどちらとも非交差となるまで試行
+          - 施工後に dst の signal 中心を復元
+        """
+        self.last_cutmix_boxes = None
+        if not self.use_cutmix or self.cutmix_prob <= 0.0:
+            return imgs
+        B, C, H, W = imgs.shape
+        if B < 2:
+            return imgs
+        if random.random() > self.cutmix_prob:
+            return imgs
+
+        idx = torch.roll(torch.arange(B, device=imgs.device), shifts=1, dims=0)
+        src = imgs.clone()      # ← コピー元のスナップショット
+        before = imgs.clone()   # ← 後で中心を復元するための“元の dst”
+
+        boxes_record: List[Tuple[int,int,int,int]] = []
 
         for i in range(B):
-            bxs = signal_bboxes[i]
+            # dst/src の bbox 群
+            dst_bxs = bboxes_batch[i] if bboxes_batch is not None else []
+            src_bxs = bboxes_batch[int(idx[i].item())] if bboxes_batch is not None else []
+
+            # 矩形サンプリング（非交差まで）
+            rect = None
+            for _ in range(self.max_trials):
+                lam = torch.distributions.Beta(self.beta, self.beta).sample().item()
+                x1, y1, x2, y2 = _rand_bbox_wh(W, H, lam, self.min_lam, self.max_lam)
+                candidate = (x1, y1, x2, y2)
+                if _any_overlap(candidate, dst_bxs) or _any_overlap(candidate, src_bxs):
+                    continue  # signal を含むのでやり直し
+                rect = candidate
+                break
+
+            if rect is None:
+                # 適切な矩形が見つからなければこのサンプルはスキップ
+                boxes_record.append((0, 0, 0, 0))
+                continue
+
+            x1, y1, x2, y2 = rect
+            imgs[i, :, y1:y2, x1:x2] = src[idx[i], :, y1:y2, x1:x2]
+            boxes_record.append(rect)
+
+        # signal の中心を保護（半径 r）
+        self._protect_dst_centers(imgs, before, bboxes_batch or [[] for _ in range(B)])
+
+        self.last_cutmix_boxes = boxes_record
+        return imgs
+
+    def __call__(self,
+                 imgs: torch.Tensor,             # (B,3,H,W) すでに学習正規化域
+                 labels: torch.Tensor,           # (B, num_classes) or (B,)
+                 signal_bboxes: Optional[List[List[Tuple[int,int,int,int]]]] = None):
+
+        device = imgs.device
+        B, C, H, W = imgs.shape
+
+        # (1) CutMix（signal 非交差 & 中心保護）
+        imgs = self._maybe_cutmix(imgs, signal_bboxes)
+
+        # (2) bbox へ signal を貼付 & ラベル上書き（labelがNONEのときはスキップ）
+        for i in range(B):
+            cur_idx = int(labels[i].argmax().item()) if labels.dim() == 2 else int(labels[i].item())
+            if cur_idx == self.none_index:
+                continue
+            if random.random() > self.mix_prob:
+                continue
+            bxs = signal_bboxes[i] if signal_bboxes is not None else []
             if not bxs:
                 continue
 
-            # ランダムに signal 画像を 1 枚選択
-            sig_name, patch_src = random.choice(list(self.signal_buf.items()))
-            patch_src = patch_src.to(device)
-            sig_lbl   = self.sig_label.get(sig_name, None)
-            if sig_lbl is None:
-                continue  # ラベル無ければスキップ
+            # ランダム signal crop を選択
+            sig_name, sig_src01 = random.choice(list(self.signal_buf.items()))
+            sig_lbl_rg = self.sig_label.get(sig_name, None)
+            if sig_lbl_rg is None:
+                continue
+            sig_norm = (sig_src01.to(device) - 0.5) / 0.5  # 0..1 -> -1..1
 
-            # --- ③ bbox すべてに貼り付け ---
+            # 各 bbox へリサイズ貼付
             for (x1, y1, x2, y2) in bxs:
-                x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
-                x1 = max(0, min(x1, W-1)); x2 = max(1, min(x2, W))
-                y1 = max(0, min(y1, H-1)); y2 = max(1, min(y2, H))
+                x1 = max(0, min(int(x1), W - 1)); x2 = max(1, min(int(x2), W))
+                y1 = max(0, min(int(y1), H - 1)); y2 = max(1, min(int(y2), H))
                 if x2 <= x1 or y2 <= y1:
                     continue
-                patch = T.resize(
-                    patch_src,
-                    (y2 - y1, x2 - x1),
-                    interpolation=transforms.InterpolationMode.BILINEAR
-                )
+                patch = self._resize_tensor(sig_norm, y2 - y1, x2 - x1)
                 imgs[i, :, y1:y2, x1:x2] = patch
 
-            # --- ④ ラベルを signal 側に置き換え ---
-            if labels.dim() == 1:
-                labels[i] = sig_lbl                       # hard-label
-            else:
+            # ラベル上書き（0/1 → 1/2）
+            mapped_idx = self.sig_to_train[int(sig_lbl_rg)]
+            if labels.dim() == 2:
                 labels[i].zero_()
-                labels[i, sig_lbl] = 1.0                  # one-hot
+                labels[i, mapped_idx] = 1.0
+            else:
+                labels[i] = mapped_idx
 
         return imgs, labels
+    
 # ------------------------------------------------------------------------- #
 
 # 8. Factory
@@ -447,6 +606,17 @@ def get_mixer(cfg: Dict, backbone=None, max_trials=3):
     if name == "keepaugment":     return KeepAugment(backbone, beta,
                                                      cfg.get("keepaugment_tau", .15), max_trials)
     if name == "signalmix":
-        return SignalMix(signal_dir = cfg["signal_dir"],
-                         mix_prob   = cfg.get("mix_prob", 0.5))
+        return SignalMix(
+            signal_dir    = cfg["signal_dir"],
+            csv_path      = cfg.get("signal_csv", r"D:\Datasets\WithCross Dataset\vidvip_signal/signal.csv"),
+            mix_prob      = cfg.get("prob", 0.5),
+            use_cutmix    = cfg.get("use_cutmix", True),
+            cutmix_prob   = cfg.get("cutmix_prob", 1.0),
+            beta          = cfg.get("beta", 1.0),
+            min_lam       = cfg.get("min_lam", 0.3),
+            max_lam       = cfg.get("max_lam", 0.7),
+            protect_radius= cfg.get("protect_radius", 50),   # ← 追加
+            max_trials    = cfg.get("max_trials", 25),       # ← 追加
+            none_index    = cfg.get("none_index", 0),
+        )
     raise ValueError(f"Unknown augmentation: {name}")

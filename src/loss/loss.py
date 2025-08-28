@@ -34,7 +34,8 @@ class FocalLoss(nn.Module):
         self.reduction = reduction
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        ce = F.cross_entropy(logits, target, weight=self.weight, reduction="none")
+        w = self.weight.to(logits.device) if getattr(self, "weight", None) is not None else None
+        ce = F.cross_entropy(logits, target, weight=w, reduction="none")
         pt = torch.exp(-ce)
         loss = ((1.0 - pt) ** self.gamma) * ce
         if self.reduction == "mean":
