@@ -4,7 +4,7 @@ experiment:
   image_size:     [224, 224]
   learning_rate:  5e-5
   weight_decay:   0.05
-  patience:       50
+  patience:       30
   min_delta:      1e-4
   task:           "classification"
   num_classes:    3
@@ -22,10 +22,10 @@ experiment:
   valid_img_dir: D:\Datasets\WithCross Dataset\image
 
   AUGMENTATION:
-    name: none # none | signalmix
+    name: signalmix # none | signalmix
     prob: 0.0
     use_cutmix: false
-    cutmix_prob: 0.5
+    cutmix_prob: 0.0
     beta: 1.0
     min_lam: 0.35
     max_lam: 0.65
@@ -36,7 +36,7 @@ experiment:
     none_index: 0
 
   LOSS:
-    name: "focal"      # "ce" / "weighted_ce" / "focal"
+    name: "weighted_ce"      # "ce" / "weighted_ce" / "focal"
     apply_class_balance: true
     beta: 0.99               # 有効サンプル数 β
     label_smoothing: 0.3
