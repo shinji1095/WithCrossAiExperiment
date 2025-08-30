@@ -1,0 +1,50 @@
+experiment:
+  epochs:         500
+  batch_size:     32
+  image_size:     [224, 224]
+  learning_rate:  1e-4
+  weight_decay:   0.05
+  patience:       30
+  min_delta:      1e-4
+  task:           "classification"
+
+  dropout_rate:     0.0
+  label_smoothing:  0.0
+  mixup_alpha:      0.0
+  cutmix_alpha:     0.0
+  drop_path_rate:   0.0
+  max_norm:         1.0
+
+  train_file_dir: D:\Datasets\WithCross Dataset\vidvip_signal\train.csv
+  valid_file_dir: D:\Datasets\WithCross Dataset\vidvip_signal\valid.csv
+  train_img_dir: D:\Datasets\WithCross Dataset\vidvip_signal\images_13_15_16_480
+  valid_img_dir: D:\Datasets\WithCross Dataset\vidvip_signal\images_13_15_16_480
+
+  AUGMENTATION:
+    name: signalmix # none | signalmix
+    prob: 0.9
+    use_cutmix: false
+    cutmix_prob: 0.0
+    beta: 1.0
+    min_lam: 0.35
+    max_lam: 0.65
+    protect_radius: 50     # ← CutMix 後に保護する半径(px)
+    max_trials: 25         # ← 非交差矩形が見つかるまでの試行回数
+    signal_dir: D:\Datasets\WithCross Dataset\vidvip_signal/signal
+    signal_csv: D:\Datasets\WithCross Dataset\vidvip_signal/signal.csv
+    none_index: 0
+
+  LOSS:
+    name: "focal"      # "ce" / "weighted_ce" / "focal"
+    apply_class_balance: true
+    beta: 0.99               # 有効サンプル数 β
+    label_smoothing: 0.3
+
+  models:
+    - name: edgenext_base.usi_in1k   
+      image_size: [320, 320]                   
+    # - name: hgnetv2_b3.ssld_stage2_ft_in1k
+    #   image_size: [288, 288]        
+    # - name: tf_efficientnet_b4.ap_in1k
+    #   image_size: [380, 380]          
+

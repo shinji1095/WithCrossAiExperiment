@@ -1,0 +1,16 @@
+experiment:
+  epochs: 500
+  batch_size: 32
+  image_size: [160, 160]
+  learning_rate: 0.0005
+  weight_decay: 0.01
+  patience: 50
+  min_delta: 1e-4
+  task: "classification"  # "classification", "regression", or "multitask"
+  state_filter: null  
+  models:
+    - test_byobnet.r160_in1k
+    - test_convnext.r160_in1k
+    - test_vit2.r160_in1k
+    - test_convnext2.r160_in1k
+    - test_convnext3.r160_in1k

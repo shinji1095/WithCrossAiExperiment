@@ -1,0 +1,4 @@
+model_file,model_name,task,accuracy,cohen_kappa,confusion_matrix,macro_f1,macro_precision,macro_recall,mcc,micro_f1,micro_precision,micro_recall,pr_auc,roc_auc
+edgenext_base.usi_in1k_best.tflite,edgenext_base.usi_in1k,classification,0.533195020746888,0.0,"[[  0   0 401]
+ [  0   0 274]
+ [  0   0 771]]",0.2318448353631033,0.177731673582296,0.3333333333333333,0.0,0.533195020746888,0.533195020746888,0.533195020746888,"{0: 0.3001501792538186, 1: 0.17848249641930874, 2: 0.5497027241812444}","{0: 0.5329188989249365, 1: 0.4864820258588476, 2: 0.5147955997502042}"

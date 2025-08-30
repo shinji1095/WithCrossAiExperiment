@@ -1,0 +1,36 @@
+experiment:
+  epochs:         500
+  batch_size:     32
+  image_size:     [224, 224]
+  learning_rate:  1e-4
+  weight_decay:   0.05
+  patience:       20
+  min_delta:      1e-4
+  task:           "classification"
+
+  dropout_rate:     0.0
+  label_smoothing:  0.0
+  mixup_alpha:      0.2
+  cutmix_alpha:     0.0
+  drop_path_rate:   0.0
+  max_norm:         1.0
+
+  augmentation:
+    name: "none"        # "cutmix" | "attentive_cutmix" | ...
+    beta: 0.5
+    keepaugment_tau: 0.15
+
+  LOSS:
+    name: "focal"      # "ce" / "weighted_ce" / "focal"
+    apply_class_balance: true
+    beta: 0.99               # 有効サンプル数 β
+    label_smoothing: 0.3
+
+  models:
+    - name: edgenext_base.usi_in1k   
+      image_size: [320, 320]                   
+    - name: hgnetv2_b3.ssld_stage2_ft_in1k
+      image_size: [288, 288]        
+    - name: tf_efficientnet_b4.ap_in1k
+      image_size: [380, 380]          
+
