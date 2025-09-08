@@ -1,14 +1,13 @@
-# src/models/classification_model_factory.py
 from __future__ import annotations
 import importlib
 import torch.nn as nn
 
-def create_classification_model(model_name: str, **kwargs) -> nn.Module:
+def create_segmentation_model(model_name: str, **kwargs) -> nn.Module:
     """
-    models/classification/<model_name>.py を import してモデルを生成。
+    models/segmentation/<model_name>.py を import してモデルを生成。
     モジュールは `build_model(**kwargs)` もしくは `Model(**kwargs)` を提供すること。
     """
-    mod = importlib.import_module(f"models.classification.{model_name}")
+    mod = importlib.import_module(f"models.segmentation.{model_name}")
     if hasattr(mod, "build_model"):
         return mod.build_model(**kwargs)
     if hasattr(mod, "Model"):
