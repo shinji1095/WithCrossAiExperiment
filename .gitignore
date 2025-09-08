@@ -6,7 +6,7 @@ src/config/__pycache__
 src/loss/__pycache__
 src/metrics/__pycache__
 src/mixer/__pycache__
-src/models/__pycache__
+src/models/__pycache__/
 src/utils/__pycache__
 viz_out
 data/image/*.JPG
@@ -17,4 +17,5 @@ data/test_image/*.jpg
 weight/pytorch/*.pth
 weight/onnx/*.onnx
 weight/tflite/*.tflite
+weight/keras
 

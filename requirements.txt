@@ -10,10 +10,12 @@ seaborn
 tensorboard
 tensorflow==2.19.0
 tensorflow_probability 
-onnx==1.15.0
+onnx==1.17.0
 tqdm
 keras==3.5.0
 scikit-learn
 onnx2tf==1.20.0
 sng4onnx==1.0.4
 onnxsim==0.4.36
+sne4onnx==1.0.13
+torch==2.7.0

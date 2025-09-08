@@ -64,14 +64,12 @@ for model_name, image_size in MODELS.items():
     print(f'\n==================== {model_name} 変換開始 ====================')
     try:
         ROOT_DIR = Path(f'weight')
-        ROOT_DIR.mkdir(exist_ok=True, parents=True)
-
         ONNX_MODEL_PATH = ROOT_DIR/ 'onnx' / f'{model_name}.onnx'
-        ONNX2TF_OUTPUT_DIR = ROOT_DIR / 'tflite' / model_name
-        TFLITE_MODEL_PATH = ROOT_DIR / f'{model_name}.tflite'
+        ONNX2TF_OUTPUT_DIR = ROOT_DIR / 'keras' / model_name
+        TFLITE_MODEL_PATH = ROOT_DIR / 'tflite' / f'{model_name}.tflite'
 
         # --- 1️⃣ timm → ONNX ---
-        # model = ClassificationModel(model_name.replace("_best", ""), 3).eval()
+        model = ClassificationModel(model_name.replace("_best", ""), 3).eval()
         model = get_model(
             'classification',
             model_name,
@@ -96,7 +94,7 @@ for model_name, image_size in MODELS.items():
             str(ONNX_MODEL_PATH),
             input_names=['input'],
             output_names=['output'],
-            opset_version=14
+            opset_version=18
         )
         print(f'[✓] ONNXエクスポート完了: {ONNX_MODEL_PATH}')
 
@@ -104,8 +102,10 @@ for model_name, image_size in MODELS.items():
         # --- 2️⃣ ONNX → Keras/SavedModel ---
         result = os.system(
             f'onnx2tf -i {ONNX_MODEL_PATH} '
-            f'-osd -oh5 -b 1 -kt /input '
+            f'-osd -oh5 -b 1 '
+            f'-prf param_replacement.json '
             f'-ois 1,3,{image_size},{image_size} '
+            f'-cotof -cotoa 1e-3 '
             f'-o {ONNX2TF_OUTPUT_DIR}'
         )
         if result != 0:

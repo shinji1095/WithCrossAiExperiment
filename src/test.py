@@ -199,6 +199,8 @@ def _eval_tflite_once(tflite_path: Path, loader: DataLoader, num_classes: int,
         images, labels = batch[:2]
         for i in range(images.shape[0]):
             x = images[i].cpu().numpy()
+            # if (x.shape[-1] != 3):
+            #     x = x.transpose((1,2,0))
             x = _prep_image_from_chw(x, orig_mean, orig_std, swap_rgb, norm_mode)  # HWC
             if len(in_shape) == 4:
                 _, H, W, C = in_shape
