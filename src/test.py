@@ -1,17 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-test.py (Torch + TFLite + ONNX + TF Keras/SavedModel, robust loaders)
-- Evaluate *.pth/*.pt/*.onnx/*.tflite/*.h5/*.keras and SavedModel directories.
-- Torch: uses training builder (models.model.get_model).
-- ONNX: auto NCHW/NHWC; RGB/norm auto-fallback if predictions collapse.
-- TFLite: quantized I/O handled; RGB/norm auto-fallback.
-- TF Keras/SavedModel:
-    * .h5/.keras -> load_model with custom_object_scope({'TFOpLambda': Lambda})
-      + safe_mode=False で再挑戦
-    * SavedModel dir -> keras.layers.TFSMLayer(call_endpoint=...), 出力は自動で key 取得
-"""
-
 import argparse
 import csv
 from pathlib import Path

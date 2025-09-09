@@ -34,7 +34,8 @@ from metrics.metrics import evaluate_classification, evaluate_regression
 from mixer.advanced_mixers import get_mixer
 from utils.visualize import write_tensorboard
 from utils.early_stopping import EarlyStopping
-
+from dataloader import SegmentationDataset, SegmentationAugment  # ← 追加
+from models.segmentation_model_factory import create_segmentation_model
 
 # --------- helpers ---------
 def _is_dist():
@@ -154,62 +155,61 @@ def _worker_init_fn(worker_id: int):
 
 
 def get_dataloaders(cfg, rank, world_size):
-
-    # === あなたの元のデータセット生成（そのまま） ===
-    train_ds = SignalMixClassificationDataset(
-        img_dir=cfg.train_img_dir,
-        annotation_csv=cfg.train_file_dir,
-        transform=SimpleTransform(),
-        is_train=True
-    )
-    valid_ds = SignalMixClassificationDataset(
-        img_dir=cfg.valid_img_dir,
-        annotation_csv=cfg.valid_file_dir,
-        transform=SimpleTransform(),
-        is_train=False
-    )
-
-    # DDP Sampler（そのまま）
-    train_sampler = torch.utils.data.distributed.DistributedSampler(
-        train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False
-    )
-    valid_sampler = torch.utils.data.distributed.DistributedSampler(
-        valid_ds, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
-    )
-
-    # ===== Windows 既定の workers を穏当にする =====
-    import platform
-    default_workers = 0 if platform.system() == "Windows" else 4
-    num_workers = int(getattr(cfg, "num_workers", default_workers))
-
-    # persistent_workers / prefetch_factor は num_workers>0 の時のみ有効
-    loader_common_kwargs = dict(
-        pin_memory=True,
-        collate_fn=signalmix_collate,
-        drop_last=False,
-        worker_init_fn=_worker_init_fn,
-    )
-    if num_workers > 0:
-        loader_common_kwargs.update(
-            dict(persistent_workers=True, prefetch_factor=getattr(cfg, "prefetch_factor", 2))
+    # === segmentation 分岐を追加 ===
+    if str(cfg.task).lower() == "segmentation":
+        tfm_train = SegmentationAugment(
+            image_size=tuple(getattr(cfg, "image_size", (320,320))),
+            mean=float(getattr(cfg, "normalize_mean", 0.5)),
+            std=float(getattr(cfg, "normalize_std", 0.5)),
+        )
+        tfm_val = SegmentationAugment(
+            image_size=tuple(getattr(cfg, "image_size", (320,320))),
+            mean=float(getattr(cfg, "normalize_mean", 0.5)),
+            std=float(getattr(cfg, "normalize_std", 0.5)),
         )
 
-    train_loader = torch.utils.data.DataLoader(
-        train_ds,
-        batch_size=cfg.batch_size,
-        sampler=train_sampler,
-        num_workers=num_workers,
-        **loader_common_kwargs,
-    )
-    valid_loader = torch.utils.data.DataLoader(
-        valid_ds,
-        batch_size=cfg.batch_size,
-        sampler=valid_sampler,
-        num_workers=num_workers,
-        **loader_common_kwargs,
-    )
+        train_ds = SegmentationDataset(
+            img_dir=cfg.train_img_dir,
+            mask_dir=cfg.train_mask_dir,
+            list_csv=getattr(cfg, "train_file_dir", None),
+            transform=tfm_train,
+            num_classes=getattr(cfg, "num_classes", None),
+        )
+        valid_ds = SegmentationDataset(
+            img_dir=cfg.valid_img_dir,
+            mask_dir=cfg.valid_mask_dir,
+            list_csv=getattr(cfg, "valid_file_dir", None),
+            transform=tfm_val,
+            num_classes=getattr(cfg, "num_classes", None),
+        )
 
-    return train_loader, valid_loader, train_sampler
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False
+        )
+        valid_sampler = torch.utils.data.distributed.DistributedSampler(
+            valid_ds, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
+        )
+
+        import platform
+        default_workers = 0 if platform.system() == "Windows" else 4
+        num_workers = int(getattr(cfg, "num_workers", default_workers))
+        loader_common_kwargs = dict(
+            pin_memory=True, drop_last=False, worker_init_fn=_worker_init_fn,
+        )
+        if num_workers > 0:
+            loader_common_kwargs.update(
+                dict(persistent_workers=True, prefetch_factor=getattr(cfg, "prefetch_factor", 2))
+            )
+
+        train_loader = torch.utils.data.DataLoader(
+            train_ds, batch_size=cfg.batch_size, sampler=train_sampler,
+            num_workers=num_workers, **loader_common_kwargs
+        )
+        valid_loader = torch.utils.data.DataLoader(
+            valid_ds, batch_size=cfg.batch_size, sampler=valid_sampler,
+            num_workers=num_workers, **loader_common_kwargs
+        )
+        return train_loader, valid_loader, train_sampler
 
 
 # -------------------------------------------------
@@ -250,6 +250,11 @@ def train_one_epoch(
 
     use_mixer = mixer is not None and str(cfg.AUGMENTATION.get("name", "none")).lower() != "none"
     pbar_disable = not _is_main_process()
+
+    seg_ignore = int(cfg.LOSS.get("ignore_index", 255))
+    seg_w = cfg.LOSS.get("class_weights", None)
+    seg_weight = torch.tensor(seg_w, dtype=torch.float32, device=device) if (task=="segmentation" and seg_w) else None
+
 
     for batch in tqdm(loader, desc="Training", disable=pbar_disable):
         # -------------------------
@@ -330,6 +335,26 @@ def train_one_epoch(
                 correct += (predicted == cls_labels).sum().item()
                 total += cls_labels.size(0)
 
+            elif task == "segmentation":
+                images, masks = batch
+                images = to_dev(images); masks = to_dev(masks)
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type=device.type):
+                    logits = model(images)  # [B,C,H,W]
+                    if not torch.isfinite(logits).all():
+                        continue
+                    loss = F.cross_entropy(logits, masks, ignore_index=seg_ignore, weight=seg_weight)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer); scaler.update()
+                total_loss += float(loss.detach().item())
+
+                # pixel-acc を学習中にも集計
+                preds = torch.argmax(logits, dim=1)
+                valid = (masks != seg_ignore)
+                correct += (preds[valid] == masks[valid]).sum().item()
+                total   += int(valid.sum().item())
+                continue
+
             elif task == "classification":
                 if not torch.isfinite(output).all():
                     logger.warning("NaN/Inf detected in output – skipping batch")
@@ -391,6 +416,14 @@ def validate_one_epoch(model, loader, loss_fn, device, task: str, logger):
 
     pbar_disable = not _is_main_process()
 
+    # segmentation 評価用
+    seg_inter = None
+    seg_union = None
+
+    # CE 設定
+    seg_ignore = 255
+    seg_weight = None
+
     with torch.no_grad():
         for batch in tqdm(loader, desc="Validating", disable=pbar_disable):
             def to_dev(x):
@@ -448,6 +481,36 @@ def validate_one_epoch(model, loader, loss_fn, device, task: str, logger):
                     if not torch.isfinite(loss):
                         logger.warning("NaN/Inf detected in loss – skipping sample")
                         continue
+                    if task == "segmentation":
+                        images, masks = batch
+                        images = to_dev(images); masks = to_dev(masks)
+                        with torch.autocast(device_type=device.type):
+                            logits = model(images)
+                            loss = F.cross_entropy(logits, masks, ignore_index=seg_ignore, weight=seg_weight)
+                        total_loss += float(loss.detach().item())
+
+                        preds = torch.argmax(logits, dim=1)
+                        valid = (masks != seg_ignore)
+                        correct += (preds[valid] == masks[valid]).sum().item()
+                        total   += int(valid.sum().item())
+
+                        # IoU 集計
+                        num_classes = logits.shape[1]
+                        preds_np = preds.cpu().numpy()
+                        masks_np = masks.cpu().numpy()
+                        for c in range(num_classes):
+                            if c == seg_ignore: continue
+                            pred_c = (preds_np == c)
+                            mask_c = (masks_np == c)
+                            inter = (pred_c & mask_c).sum()
+                            union = (pred_c | mask_c).sum()
+                            if seg_inter is None:
+                                seg_inter = np.zeros(num_classes, dtype=np.int64)
+                                seg_union = np.zeros(num_classes, dtype=np.int64)
+                            seg_inter[c] += inter
+                            seg_union[c] += union
+                        continue
+
 
                     y_true_cls.extend(cls_labels.cpu().tolist())
                     y_pred_cls.extend(output.argmax(dim=1).cpu().tolist())
@@ -481,6 +544,19 @@ def validate_one_epoch(model, loader, loss_fn, device, task: str, logger):
             metrics = evaluate_classification(y_true_cls, y_pred_cls, np.array(y_prob_cls), num_classes=3)
     elif task == "regression":
         metrics = evaluate_regression(y_true_reg, y_pred_reg)
+    elif task == "segmentation":
+        pix_acc = (correct / total * 100.0) if total > 0 else 0.0
+        miou = 0.0
+        per_class_iou = {}
+        if seg_inter is not None and seg_union is not None:
+            iou = np.divide(seg_inter, np.maximum(1, seg_union), dtype=np.float64)
+            valid_cls = [i for i in range(len(iou)) if seg_union[i] > 0]
+            miou = float(iou[valid_cls].mean()) if valid_cls else 0.0
+            per_class_iou = {f"class_{i}_iou": float(iou[i]) for i in valid_cls}
+
+        denom = max(1, len(loader))
+        metrics = {"pixel_acc": pix_acc, "miou": miou, **per_class_iou}
+        return total_loss / denom, pix_acc, metrics
     else:  # multitask
         cls_metrics = {}
         if len(set(y_true_cls)) >= 2:
@@ -539,19 +615,23 @@ def main_worker(rank: int, world_size: int):
         # ---------- model ----------
         t0 = time.time()
         logger.info(f"[R{rank}] Loading model {cfg.model_name} …")
-        model = get_model(
-            cfg.task,
-            cfg.model_name,
-            num_classes=3,
-            dropout_rate=cfg.dropout_rate,
-            drop_path_rate=cfg.drop_path_rate,
-        ).to(device)
-        logger.info(f"[R{rank}] Model loaded ({time.time() - t0:.1f}s)")
-        dist.barrier()
+        if str(cfg.task).lower() == "segmentation":
+            model = create_segmentation_model(  # ← segmentation は専用factoryで
+                cfg.model_name,
+                num_classes=int(getattr(cfg, "num_classes", 2)),
+                dropout_rate=cfg.dropout_rate,
+                drop_path_rate=cfg.drop_path_rate,
+            ).to(device)
+        else:
+            model = get_model(
+                cfg.task,
+                cfg.model_name,
+                num_classes=int(getattr(cfg, "num_classes", 3)),  # ← 固定3を修正
+                dropout_rate=cfg.dropout_rate,
+                drop_path_rate=cfg.drop_path_rate,
+            ).to(device)
 
-        # DDP wrapper
         model = DDP(model, device_ids=[rank])
-
         if rank == 0:
             wandb.watch(model.module)
 
@@ -559,14 +639,13 @@ def main_worker(rank: int, world_size: int):
         train_loader, valid_loader, train_sampler = get_dataloaders(cfg, rank, world_size)
 
         # ---------- Advanced Mixer ----------
-        mixer = get_mixer(cfg.AUGMENTATION, backbone=model.module)
+        mixer = None if str(cfg.task).lower()=="segmentation" else get_mixer(cfg.AUGMENTATION, backbone=model.module)
 
         # ---------- optimizer / loss ----------
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
         scaler = torch.cuda.amp.GradScaler()
-        loss_fn = get_loss_fn(cfg.LOSS, task=cfg.task, class_counts=train_loader.dataset.class_counts)
-        if hasattr(loss_fn, "to"):
-            loss_fn = loss_fn.to(device)
+        loss_fn = get_loss_fn(cfg.LOSS, task=cfg.task, class_counts=getattr(train_loader.dataset, "class_counts", None))
+        if hasattr(loss_fn, "to"): loss_fn = loss_fn.to(device)
 
         # ---------- logging ----------
         if rank == 0:
@@ -631,6 +710,9 @@ def main_worker(rank: int, world_size: int):
                     "val/loss": va_loss,
                     "val/acc": va_acc,
                 }
+                if str(cfg.task).lower() == "segmentation" and va_metrics:
+                    for k in ["pixel_acc","miou"]:
+                        if k in va_metrics: log_data[f"val/{k}"] = va_metrics[k]
                 if cfg.task in ["classification", "multitask"] and va_metrics:
                     cls = va_metrics["classification"] if cfg.task == "multitask" else va_metrics
                     for k in ["macro_f1", "micro_f1", "cohen_kappa", "mcc"]:
