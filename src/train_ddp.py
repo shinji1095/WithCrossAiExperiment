@@ -155,6 +155,7 @@ def _worker_init_fn(worker_id: int):
 
 
 def get_dataloaders(cfg, rank, world_size):
+    train_sampler = None
     # === segmentation 分岐を追加 ===
     if str(cfg.task).lower() == "segmentation":
         tfm_train = SegmentationAugment(
@@ -183,6 +184,19 @@ def get_dataloaders(cfg, rank, world_size):
             num_classes=getattr(cfg, "num_classes", None),
         )
 
+    else:
+        train_ds = SignalMixClassificationDataset(
+            img_dir=cfg.train_img_dir,
+            annotation_csv=cfg.train_file_dir,
+            transform=SimpleTransform(),
+            is_train=True
+        )      
+        valid_ds = SignalMixClassificationDataset(
+            img_dir=cfg.valid_img_dir,
+            annotation_csv=cfg.valid_file_dir,
+            transform=SimpleTransform(),
+            is_train=False
+        )
         train_sampler = torch.utils.data.distributed.DistributedSampler(
             train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False
         )
@@ -201,15 +215,13 @@ def get_dataloaders(cfg, rank, world_size):
                 dict(persistent_workers=True, prefetch_factor=getattr(cfg, "prefetch_factor", 2))
             )
 
-        train_loader = torch.utils.data.DataLoader(
-            train_ds, batch_size=cfg.batch_size, sampler=train_sampler,
+        train_loader = torch.utils.data.DataLoader(train_ds, batch_size=cfg.batch_size, sampler=train_sampler,
             num_workers=num_workers, **loader_common_kwargs
-        )
-        valid_loader = torch.utils.data.DataLoader(
-            valid_ds, batch_size=cfg.batch_size, sampler=valid_sampler,
+        , collate_fn=signalmix_collate)
+        valid_loader = torch.utils.data.DataLoader(valid_ds, batch_size=cfg.batch_size, sampler=valid_sampler,
             num_workers=num_workers, **loader_common_kwargs
-        )
-        return train_loader, valid_loader, train_sampler
+        , collate_fn=signalmix_collate)
+    return train_loader, valid_loader, train_sampler
 
 
 # -------------------------------------------------
@@ -643,7 +655,7 @@ def main_worker(rank: int, world_size: int):
 
         # ---------- optimizer / loss ----------
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.amp.GradScaler('cuda' if device.type == 'cuda' else 'cpu')
         loss_fn = get_loss_fn(cfg.LOSS, task=cfg.task, class_counts=getattr(train_loader.dataset, "class_counts", None))
         if hasattr(loss_fn, "to"): loss_fn = loss_fn.to(device)
 
@@ -662,7 +674,8 @@ def main_worker(rank: int, world_size: int):
         result_log = []
 
         for epoch in range(cfg.epochs):
-            train_sampler.set_epoch(epoch)
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
 
             # ----- train -----
             tr_loss, tr_acc = train_one_epoch(
