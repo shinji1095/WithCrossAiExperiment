@@ -8,7 +8,6 @@ from pathlib import Path
 import torch
 import tensorflow as tf
 
-# src 直下を import パスに追加
 THIS_FILE = Path(__file__).resolve()
 SRC_DIR   = THIS_FILE.parents[1]           # .../src
 ROOT_DIR  = THIS_FILE.parents[2]
@@ -40,7 +39,7 @@ def main():
     ap.add_argument("--drop_path", type=float, default=0.0)
     ap.add_argument("--weights", type=str, default=None,
                     help="明示的に.pthを指定する場合。未指定時は weight/pytorch/<task>/<model>.pth")
-    ap.add_argument("--opset", type=int, default=18)
+    ap.add_argument("--opset", type=int, default=14)
     ap.add_argument("--extra_onnx2tf_args", type=str, default="",
                     help='onnx2tf追加引数をそのまま渡す（例: "--keep_input_tensor"）')
     args = ap.parse_args()
@@ -48,7 +47,6 @@ def main():
     task       = args.task
     model_name = args.model
 
-    # ルート/出力ディレクトリ
     weight_root     = ROOT_DIR / "weight"
     onnx_dir        = weight_root / "onnx" / task
     keras_dir       = weight_root / "keras" / task / model_name
@@ -60,10 +58,8 @@ def main():
     onnx_path   = onnx_dir / f"{model_name}.onnx"
     tflite_path = tflite_dir / f"{model_name}.tflite"
 
-    # 画像サイズの決定
     image_size = args.image_size or get_default_image_size(task, model_name, fallback=320)
 
-    # モデル構築
     build_kwargs = {
         "num_classes": args.num_classes,
         "dropout_rate": args.dropout,
@@ -75,7 +71,6 @@ def main():
     print(f"[INFO] Build model: task={task}, name={model_name}, image_size={image_size}")
     model = get_model(task, model_name, **build_kwargs).eval()
 
-    # 重みロード
     weights_path = Path(args.weights) if args.weights else (weight_root / "pytorch" / task / f"{model_name}.pth")
     if not weights_path.exists():
         raise FileNotFoundError(f"weights not found: {weights_path}")
@@ -83,7 +78,6 @@ def main():
     model.load_state_dict(state, strict=True)
     print(f"[✓] Loaded weights: {weights_path}")
 
-    # ダミー入力で ONNX へ
     dummy = torch.randn(1, 3, image_size, image_size, dtype=torch.float32)
     torch.onnx.export(
         model,
@@ -97,8 +91,6 @@ def main():
     )
     print(f"[✓] Exported ONNX: {onnx_path}")
 
-    # onnx2tf 実行（SavedModel/Keras 出力）
-    # 例）onnx2tf -i <onnx> -osd -oh5 -b 1 -ois 1,3,H,W -o <keras_dir>
     onnx2tf_cmd = [
         "onnx2tf", "-i", str(onnx_path),
         "-osd", "-b", "1",
@@ -111,7 +103,6 @@ def main():
     run_cmd(onnx2tf_cmd)
     print(f"[✓] Built SavedModel/Keras: {keras_dir}")
 
-    # SavedModel → TFLite
     converter = tf.lite.TFLiteConverter.from_saved_model(str(keras_dir))
     # 安定化オプション
     converter.experimental_new_converter = True
