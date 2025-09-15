@@ -43,6 +43,9 @@ def get_model(
         return mod.build_model(**kwargs)
     if hasattr(mod, "Model"):
         return mod.Model(**kwargs)
+
+
+        
     raise AttributeError(
         f"Module {mod.__name__} must expose `build_model` or `Model`."
     )

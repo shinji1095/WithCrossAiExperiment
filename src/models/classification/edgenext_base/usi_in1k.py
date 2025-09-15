@@ -32,26 +32,26 @@ class ClassificationModel(nn.Module):
         dropout_rate: float = 0.0,
         drop_path_rate: float = 0.0,
         in_chans: int = 3,
-        pretrained: bool = True,
+        pretrained: bool = False,
     ):
         super().__init__()
         self.backbone = timm.create_model(
             backbone_name,
             pretrained=pretrained,
-            num_classes=0, 
+            num_classes=num_classes, 
             drop_path_rate=drop_path_rate,
             in_chans=in_chans,
         )
-        in_features  = _get_in_features(self.backbone)
-        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
-        self.head    = nn.Linear(in_features, num_classes)
+        # in_features  = _get_in_features(self.backbone)
+        # self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
+        # self.head    = nn.Linear(in_features, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feat = self.backbone(x)
-        if feat.ndim == 4:
-            feat = feat.mean(dim=[2, 3])
-        feat = self.dropout(feat)
-        return self.head(feat)
+        # feat = self.backbone(x)
+        # if feat.ndim == 4:
+        #     feat = feat.mean(dim=[2, 3])
+        # feat = self.dropout(feat)
+        return self.backbone(x)
 
 def build_model(
     num_classes: int,
@@ -59,7 +59,8 @@ def build_model(
     dropout_rate: float = 0.0,
     drop_path_rate: float = 0.0,
     in_chans: int = 3,
-    pretrained: bool = True,
+    pretrained: bool = False,
+    **kwargs
 ) -> nn.Module:
     """
     get_model('classification', 'edgenext', num_classes=..., ...) から呼ばれる想定。
