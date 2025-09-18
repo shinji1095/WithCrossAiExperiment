@@ -1,5 +1,27 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Unified evaluator for classification / regression across PyTorch / ONNX / TFLite / Keras.
+
+- Uses user-provided evaluate_classification / evaluate_regression to compute metrics
+- Robust checkpoint unwrapping:
+    * recursively extract real state_dict from common wrappers
+    * if 'state_dict' shows up as an unexpected key, retry with ckpt['state_dict']
+- Pick config by filename: exact > prefix(with delimiter) > substring, then longest match
+- Task via CLI: --task {classification,regression}
+- Supports: .pth/.pt, .onnx, .tflite, .h5/.keras or SavedModel dir
+- CSV output per model file
+- Windows-friendly DataLoader (default workers=0) and top-level transform to avoid pickling errors.
+
+Usage:
+  python src/test.py --task classification --config src/config/test.yaml --weights_dir weight/test
+"""
+
+from __future__ import annotations
 import argparse
 import csv
+import os
+import platform
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -8,563 +30,505 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# ---- Project modules ----
-from config.config import load_all_training_configs
-from dataset_signalmix import SignalMixClassificationDataset
+# --- import path: add src/ to sys.path ---
+import sys
+THIS = Path(__file__).resolve()
+SRC  = THIS.parent
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+# --- project modules ---
+from config.config import load_all_training_configs                 # YAML loader
+from models.model import get_model                                  # model builder
+from dataset_signalmix import SignalMixClassificationDataset        # classification dataset
+from dataset import SignalSlopeDataset                               # regression dataset
 from metrics.metrics import evaluate_classification, evaluate_regression
-from models.model import get_model
 
-
-# ===== Dataset Transform & Collate (aligned to training) =====
-class SimpleTransform:
-    """Resize -> ToTensor(0..1) -> Normalize(mean,std) (default mean=std=0.5 -> -1..1)"""
-    def __init__(self, size_hw=None, mean=0.5, std=0.5):
-        self.size_hw = tuple(size_hw) if size_hw is not None else None  # (H, W)
+# ====== Top-level transforms (Windows pickling-safe) ======
+class ClassifyTransform:
+    """Resize -> to CHW float32 in [-1,1] (mean=std=0.5 by default)."""
+    def __init__(self, size_hw: Tuple[int, int], mean=0.5, std=0.5):
+        self.H, self.W = int(size_hw[0]), int(size_hw[1])
         self.mean = float(mean); self.std = float(std)
-
-    def base_transform(self, image):
-        import cv2, torch
-        if self.size_hw is not None:
-            H, W = self.size_hw
-            image = cv2.resize(image, (W, H), interpolation=cv2.INTER_LINEAR)
-        t = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+    def __call__(self, image: np.ndarray) -> torch.Tensor:
+        import cv2
+        img = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_LINEAR)
+        t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
         t = (t - self.mean) / self.std
-        return {"image": t}
+        return t
 
+class EvalTransform:
+    """Dataset 側が期待する base_transform(image)->{'image':tensor} を提供。"""
+    def __init__(self, size_hw: Tuple[int,int], mean=0.5, std=0.5):
+        self._tfm = ClassifyTransform(size_hw, mean, std)
+    def base_transform(self, image: np.ndarray) -> Dict[str, torch.Tensor]:
+        return {"image": self._tfm(image)}
 
-def signalmix_collate(batch):
-    if len(batch[0]) == 3:
-        imgs, labels, bboxes = zip(*batch)
-        return torch.stack(imgs, 0), torch.as_tensor(labels, dtype=torch.long), list(bboxes)
-    else:
-        imgs, labels = zip(*batch)
-        return torch.stack(imgs, 0), torch.as_tensor(labels, dtype=torch.long)
+class RegrTransformAdapter:
+    """SignalSlopeDataset 期待の (image_np, slope)->(tensor, slope)。"""
+    def __init__(self, size_hw: Tuple[int,int], mean=0.5, std=0.5):
+        self._tfm = ClassifyTransform(size_hw, mean, std)
+    def __call__(self, image_np: np.ndarray, slope_deg: float):
+        return self._tfm(image_np), slope_deg
 
+def _collate_xy(batch):
+    imgs, ys = [], []
+    for b in batch:
+        imgs.append(b[0]); ys.append(b[1])
+    return torch.stack(imgs, 0), torch.stack(ys, 0) if torch.is_tensor(ys[0]) else torch.as_tensor(ys)
 
-# ===== Utilities =====
-def _first_not_none(*vals, default=None):
-    for v in vals:
-        if v is not None:
-            return v
-    return default
+# ====== File / cfg helpers ======
+def _is_saved_model_dir(p: Path) -> bool:
+    return p.is_dir() and (p / "saved_model.pb").exists()
 
-def _safe_int(x, default: int):
-    try:
-        return int(x) if x is not None else default
-    except Exception:
-        return default
+def _gather_models(wdir: Path) -> List[Path]:
+    files: List[Path] = []
+    files += sorted(list(wdir.glob("*.pth")) + list(wdir.glob("*.pt")))
+    files += sorted(list(wdir.glob("*.onnx")))
+    files += sorted(list(wdir.glob("*.tflite")))
+    files += sorted(list(wdir.glob("*.h5")) + list(wdir.glob("*.keras")))
+    files += [p for p in wdir.iterdir() if _is_saved_model_dir(p)]
+    return files
 
-def _softmax_np(logits: np.ndarray) -> np.ndarray:
-    z = logits - np.max(logits, axis=-1, keepdims=True)
-    ez = np.exp(z); return ez / np.sum(ez, axis=-1, keepdims=True)
+def _score_name_match(cfg_name: str, stem: str) -> Tuple[int, int]:
+    """Return (rank, length). Higher is better. 3 exact, 2 prefix(delimited), 1 substring, 0 no match."""
+    cfg = cfg_name.strip().lower()
+    s   = stem.strip().lower()
+    if s == cfg:
+        return (3, len(cfg))
+    if s.startswith(cfg) and (len(s) == len(cfg) or s[len(cfg)] in ('.', '-', '_')):
+        return (2, len(cfg))
+    if cfg in s:
+        return (1, len(cfg))
+    return (0, 0)
 
-def _degenerate(preds: np.ndarray, acc: float) -> bool:
-    if len(preds) == 0: return True
-    dom = np.bincount(preds).max() / len(preds)
-    return dom >= 0.95 or acc < 0.2
+def _pick_cfg(cfgs, task: str, filename_stem: str):
+    task = str(task).lower()
+    scored: List[Tuple[Tuple[int,int], Any]] = []
+    for c in cfgs:
+        c_task = str(getattr(c, "task", task)).lower()
+        if c_task != task:
+            continue
+        c_name = str(getattr(c, "model_name", ""))
+        score  = _score_name_match(c_name, filename_stem)
+        if score[0] > 0:
+            scored.append((score, c))
+    if scored:
+        scored.sort(key=lambda x: (x[0][0], x[0][1]), reverse=True)
+        return scored[0][1]
+    for c in cfgs:
+        if str(getattr(c, "task", task)).lower() == task:
+            return c
+    return cfgs[0]
 
-
-# ===== Config & Torch helpers =====
-def pick_cfg_for_ckpt(cfg_list, ckpt: Dict[str, Any]):
-    ck_name = str(ckpt.get("model_name", "") or "").lower()
-    ck_task = str(ckpt.get("task", "") or "").lower()
-    ck_ncls = _safe_int(ckpt.get("num_classes", None), -1)
-    def score(c):
-        s = 0
-        if ck_name and ck_name == str(getattr(c, "model_name", "")).lower(): s += 2
-        if ck_task and ck_task == str(getattr(c, "task", "")).lower(): s += 1
-        if ck_ncls > 0 and ck_ncls == int(getattr(c, "num_classes", 3)): s += 1
-        return s
-    return max(cfg_list, key=score) if cfg_list else None
-
-def build_model_from_cfg_via_builder(cfg, override_ckpt: Optional[Dict[str, Any]] = None,
-                                     ds_num_classes: Optional[int] = None):
-    ck = override_ckpt or {}
-    if "model_name" in ck and ck["model_name"]: cfg.model_name = ck["model_name"]
-    if "task" in ck and ck["task"]: cfg.task = ck["task"]
-    cfg.num_classes = _safe_int(_first_not_none(ck.get("num_classes"),
-                                               getattr(cfg, "num_classes", None),
-                                               ds_num_classes, 3), 3)
-    model = get_model(cfg.task, cfg.model_name,
-                      num_classes=int(cfg.num_classes),
-                      dropout_rate=getattr(cfg, "dropout_rate", 0.0),
-                      drop_path_rate=getattr(cfg, "drop_path_rate", 0.0))
-    return model, str(cfg.task).lower(), int(cfg.num_classes), str(cfg.model_name)
-
-def load_state_dict_safely(model: torch.nn.Module, ckpt: Dict[str, Any]) -> None:
-    if isinstance(ckpt, dict) and "state_dict" in ckpt: state = ckpt["state_dict"]
-    elif isinstance(ckpt, dict) and "model" in ckpt:     state = ckpt["model"]
-    else:                                                state = ckpt
-    new_state = {}
+def _strip_module_prefix(state: Dict[str, Any]) -> Dict[str, Any]:
+    out = {}
     for k, v in state.items():
-        new_state[k[7:] if isinstance(k, str) and k.startswith("module.") else k] = v
-    missing, unexpected = model.load_state_dict(new_state, strict=False)
-    if missing:   print(f"[WARN] missing keys: {missing[:12]}{'...' if len(missing)>12 else ''}")
-    if unexpected:print(f"[WARN] unexpected keys: {unexpected[:12]}{'...' if len(unexpected)>12 else ''}")
+        nk = k[7:] if isinstance(k, str) and k.startswith("module.") else k
+        out[nk] = v
+    return out
 
+# ====== Checkpoint unwrapping ======
+def _looks_like_state_dict(d: Dict[str, Any]) -> bool:
+    if not isinstance(d, dict) or not d:
+        return False
+    hit_dot = 0
+    hit_tensor = 0
+    for k, v in d.items():
+        if isinstance(k, str) and ('.' in k or k.endswith(('weight','bias'))):
+            hit_dot += 1
+        if torch.is_tensor(v) or isinstance(v, (torch.nn.Parameter,)):
+            hit_tensor += 1
+    return (hit_dot >= 3 and hit_tensor >= 3)
 
-# ===== Torch evaluation =====
-def evaluate_model_torch(model, loader, device, task: str, num_classes: int):
+def _extract_state_dict_like(obj: Any, depth: int = 0) -> Optional[Dict[str, Any]]:
+    if obj is None or depth > 4:
+        return None
+    if isinstance(obj, dict) and _looks_like_state_dict(obj):
+        return obj
+    if isinstance(obj, dict):
+        for key in ["state_dict", "model", "model_state", "model_state_dict",
+                    "module", "net", "weights", "params"]:
+            if key in obj:
+                got = _extract_state_dict_like(obj[key], depth + 1)
+                if got is not None:
+                    return got
+    if hasattr(obj, "state_dict") and callable(getattr(obj, "state_dict")):
+        try:
+            sd = obj.state_dict()
+            if isinstance(sd, dict) and _looks_like_state_dict(sd):
+                return sd
+        except Exception:
+            pass
+    return None
+
+# ====== Common helpers ======
+def _softmax_np(y):
+    y = np.array(y)
+    y = y - y.max(axis=-1, keepdims=True)
+    e = np.exp(y)
+    return e / e.sum(axis=-1, keepdims=True)
+
+def _load_state_flex(model: torch.nn.Module, state_in: Dict[str, Any]) -> Dict[str, Any]:
+    own = model.state_dict()
+    loaded = _strip_module_prefix(state_in)
+    missing = [k for k in own.keys() if k not in loaded]
+    unexpected = [k for k in loaded.keys() if k not in own]
+    mismatched = []
+    filtered = {}
+    for k, v in loaded.items():
+        if k in own and own[k].shape != v.shape:
+            mismatched.append((k, tuple(v.shape), tuple(own[k].shape)))
+        elif k in own:
+            filtered[k] = v
+    msg = (f"[partial load] loaded={len(filtered)} missing={len(missing)} "
+           f"mismatched={len(mismatched)} unexpected={len(unexpected)}")
+    if mismatched:
+        ex = ", ".join([f"('{k}', {src}, {dst})" for k, src, dst in mismatched[:3]])
+        msg += f"\n  mismatched examples: [{ex}]"
+    print(msg)
+    model.load_state_dict(filtered, strict=False)
+    return {
+        "missing": missing,
+        "unexpected": unexpected,
+        "mismatched": mismatched,
+        "loaded_count": len(filtered),
+    }
+
+# ====== Framework runners ======
+def run_pytorch(pth: Path, task: str, cfg, num_classes: int, device: torch.device,
+                loader: DataLoader) -> Dict[str, Any]:
+    kwargs = dict(dropout_rate=getattr(cfg, "dropout_rate", 0.0),
+                  drop_path_rate=getattr(cfg, "drop_path_rate", 0.0))
+    if task == "classification":
+        kwargs["num_classes"] = int(num_classes)
+    model = get_model(task, getattr(cfg, "model_name", ""), cfg=cfg, **kwargs).to(device)
+
+    ckpt = torch.load(str(pth), map_location="cpu", weights_only=False)
+    state = _extract_state_dict_like(ckpt)
+    if state is None:
+        state = ckpt.get("state_dict", ckpt.get("model", ckpt)) if isinstance(ckpt, dict) else ckpt
+    summary = _load_state_flex(model, state)
+    if "state_dict" in summary["unexpected"] and isinstance(ckpt, dict) and isinstance(ckpt.get("state_dict", None), dict):
+        print("[info] Retrying with ckpt['state_dict'] because 'state_dict' was unexpected.")
+        summary = _load_state_flex(model, ckpt["state_dict"])
+
     model.eval()
     y_true, y_pred, y_prob = [], [], []
+    y_reg_true, y_reg_pred = [], []
+
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Testing (Torch)", leave=False):
-            images, labels = batch[:2]
+        for images, labels in tqdm(loader, desc=f"[Torch] {pth.name}", leave=False):
             images = images.to(device, non_blocking=True)
-            with torch.autocast(device_type='cuda', enabled=(device.type=='cuda')):
+            if task == "classification":
                 logits = model(images).float()
-            y_true.extend(labels.cpu().tolist())
-            y_pred.extend(logits.argmax(1).cpu().tolist())
-            y_prob.extend(torch.softmax(logits, 1).cpu().numpy())
-    return evaluate_classification(y_true, y_pred, np.array(y_prob), num_classes=num_classes)
+                probs = torch.softmax(logits, dim=1).cpu().numpy()
+                y_true.extend(labels.cpu().tolist())
+                y_pred.extend(np.argmax(probs, axis=1).tolist())
+                y_prob.extend(probs)
+            else:
+                out = model(images).float().squeeze()
+                y_reg_true.extend(labels.cpu().view(-1).tolist())
+                y_reg_pred.extend(out.cpu().view(-1).tolist())
 
+    if task == "classification":
+        y_prob_np = np.asarray(y_prob) if len(y_prob) else np.zeros((0, int(num_classes or 1)))
+        ncls_eff = int(num_classes or (y_prob_np.shape[1] if y_prob_np.size else 1))
+        return evaluate_classification(y_true, y_pred, y_prob_np, ncls_eff)
+    return evaluate_regression(y_reg_true, y_reg_pred)
 
-# ===== TFLite evaluation =====
-def _load_tflite_interpreter(model_path: Path):
-    try:
-        from tflite_runtime.interpreter import Interpreter  # type: ignore
-        it = Interpreter(model_path=str(model_path)); it.allocate_tensors(); return it
-    except Exception:
-        pass
-    try:
-        import tensorflow as tf  # type: ignore
-        it = tf.lite.Interpreter(model_path=str(model_path)); it.allocate_tensors(); return it
-    except Exception:
-        pass
-    try:
-        from tensorflow.lite.python.interpreter import Interpreter  # type: ignore
-        it = Interpreter(model_path=str(model_path)); it.allocate_tensors(); return it
-    except Exception as e:
-        raise ImportError("TFLite interpreter not found. Install tflite-runtime or tensorflow.") from e
-
-def _get_scale_zero(detail: Dict[str, Any]) -> Tuple[float, int]:
-    q = detail.get("quantization", None)
-    if q and len(q) == 2 and q[0] not in (None, 0.0): return float(q[0]), int(q[1])
-    qp = detail.get("quantization_parameters", None)
-    if qp:
-        scales = qp.get("scales", []); zeros = qp.get("zero_points", [])
-        if len(scales) > 0: return float(scales[0]), int(zeros[0] if len(zeros)>0 else 0)
-    return 1.0, 0
-
-def _quantize_if_needed(x: np.ndarray, detail: Dict[str, Any]) -> np.ndarray:
-    dtype = detail["dtype"]
-    if dtype == np.float32: return x.astype(np.float32, copy=False)
-    scale, zero = _get_scale_zero(detail); scale = 1.0 if scale == 0 else scale
-    xq = np.round(x / scale + zero)
-    if dtype == np.int8:  return np.clip(xq, -128, 127).astype(np.int8)
-    if dtype == np.uint8: return np.clip(xq, 0, 255).astype(np.uint8)
-    return xq.astype(dtype)
-
-def _dequantize_if_needed(y: np.ndarray, detail: Dict[str, Any]) -> np.ndarray:
-    dtype = detail["dtype"]
-    if dtype == np.float32: return y.astype(np.float32, copy=False)
-    scale, zero = _get_scale_zero(detail); scale = 1.0 if scale == 0 else scale
-    return (y.astype(np.float32) - float(zero)) * float(scale)
-
-def _prep_image_from_chw(x_chw: np.ndarray, orig_mean: float, orig_std: float,
-                         swap_rgb: bool, norm_mode: str) -> np.ndarray:
-    x01 = x_chw * float(orig_std) + float(orig_mean)
-    x_hwc = np.transpose(x01, (1, 2, 0))  # BGR
-    if swap_rgb: x_hwc = x_hwc[..., ::-1]  # BGR->RGB
-    if norm_mode == 'neg11':
-        x_hwc = (x_hwc - 0.5) / 0.5
-    elif norm_mode == 'imagenet':
-        mean = np.array([0.485, 0.456, 0.406], np.float32)
-        std  = np.array([0.229, 0.224, 0.225], np.float32)
-        x_hwc = (x_hwc - mean) / std
-    return x_hwc.astype(np.float32, copy=False)
-
-def _eval_tflite_once(tflite_path: Path, loader: DataLoader, num_classes: int,
-                      orig_mean: float, orig_std: float,
-                      swap_rgb: bool, norm_mode: str):
-    it = _load_tflite_interpreter(tflite_path)
-    in_d = it.get_input_details()[0]; out_d = it.get_output_details()[0]
-    in_idx = in_d["index"]; in_shape = tuple(in_d["shape"])
-    y_true, y_pred, y_prob = [], [], []
-    for batch in tqdm(loader, desc=f"TFLite {tflite_path.name} [{('RGB' if swap_rgb else 'BGR')},{norm_mode}]", leave=False):
-        images, labels = batch[:2]
-        for i in range(images.shape[0]):
-            x = images[i].cpu().numpy()
-            # if (x.shape[-1] != 3):
-            #     x = x.transpose((1,2,0))
-            x = _prep_image_from_chw(x, orig_mean, orig_std, swap_rgb, norm_mode)  # HWC
-            if len(in_shape) == 4:
-                _, H, W, C = in_shape
-                if H>0 and W>0 and C>0 and x.shape[:2] != (H, W):
-                    import cv2; x = cv2.resize(x, (W, H), interpolation=cv2.INTER_LINEAR)
-                x = x[None, ...]
-            it.set_tensor(in_idx, _quantize_if_needed(x, in_d)); it.invoke()
-            y = _dequantize_if_needed(it.get_tensor(out_d["index"]), out_d)
-            probs = _softmax_np(y.reshape(1, -1))[0]
-            y_true.append(int(labels[i].item())); y_pred.append(int(np.argmax(probs))); y_prob.append(probs)
-    m = evaluate_classification(y_true, y_pred, np.array(y_prob), num_classes=num_classes)
-    return m, np.array(y_pred)
-
-def evaluate_model_tflite_auto(tflite_path: Path, loader: DataLoader, num_classes: int,
-                               orig_mean: float, orig_std: float,
-                               force_rgb: Optional[bool] = None, use_imagenet_norm: Optional[bool] = None):
-    swap_rgb = bool(force_rgb) if force_rgb is not None else False
-    norm_mode = 'imagenet' if use_imagenet_norm else 'neg11'
-    m, p = _eval_tflite_once(tflite_path, loader, num_classes, orig_mean, orig_std, swap_rgb, norm_mode)
-    if _degenerate(p, float(m.get("accuracy", 0.0))) and (force_rgb is None or use_imagenet_norm is None):
-        cands = [(True, 'neg11'), (True, 'imagenet')]
-        best_m, best = m, (swap_rgb, norm_mode); best_acc = float(m.get("accuracy", 0.0))
-        for cand in cands:
-            m2, _ = _eval_tflite_once(tflite_path, loader, num_classes, orig_mean, orig_std, *cand)
-            acc2 = float(m2.get("accuracy", 0.0))
-            if acc2 > best_acc: best_m, best, best_acc = m2, cand, acc2
-        if best != (swap_rgb, norm_mode):
-            print(f"[INFO] TFLite auto-selected RGB={best[0]}, norm={best[1]} (acc={best_acc:.4f})")
-            m = best_m
-    return m
-
-
-# ===== ONNX evaluation =====
-def _load_onnx_session(onnx_path: Path):
-    import onnxruntime as ort  # type: ignore
-    so = ort.SessionOptions(); so.intra_op_num_threads = 1
-    return ort.InferenceSession(str(onnx_path), sess_options=so, providers=['CPUExecutionProvider'])
-
-def _detect_layout_from_onnx(sess) -> str:
+def _detect_onnx_layout(sess) -> str:
     inp = sess.get_inputs()[0]; shp = list(inp.shape)
     try:
         if len(shp) == 4:
             c2 = int(shp[1]) if isinstance(shp[1], (int, np.integer)) else None
             cL = int(shp[-1]) if isinstance(shp[-1], (int, np.integer)) else None
-            if c2 == 3: return 'nchw'
-            if cL == 3: return 'nhwc'
+            if c2 == 3: return "nchw"
+            if cL == 3: return "nhwc"
     except Exception:
         pass
-    return 'nchw'
+    return "nchw"
 
-def _eval_onnx_once(onnx_path: Path, loader: DataLoader, num_classes: int,
-                    orig_mean: float, orig_std: float,
-                    layout: str, swap_rgb: bool, norm_mode: str):
-    sess = _load_onnx_session(onnx_path)
-    inp = sess.get_inputs()[0]; out = sess.get_outputs()[0]
-    in_name, out_name = inp.name, out.name
-    y_true, y_pred, y_prob = [], [], []
-    for batch in tqdm(loader, desc=f"ONNX {onnx_path.name} [{layout},{'RGB' if swap_rgb else 'BGR'},{norm_mode}]", leave=False):
-        images, labels = batch[:2]
-        for i in range(images.shape[0]):
-            x_chw = images[i].cpu().numpy()
-            if layout == 'nchw':
-                if not swap_rgb and norm_mode == 'neg11':
-                    xin = x_chw[None, ...].astype(np.float32)
-                else:
-                    x = _prep_image_from_chw(x_chw, orig_mean, orig_std, swap_rgb, norm_mode)  # HWC
-                    xin = np.transpose(x, (2,0,1))[None, ...].astype(np.float32)
-            else:
-                x = _prep_image_from_chw(x_chw, orig_mean, orig_std, swap_rgb, norm_mode)
-                xin = x[None, ...].astype(np.float32)
-            outs = sess.run([out_name], {in_name: xin})[0]
-            probs = _softmax_np(outs.reshape(1, -1))[0]
-            y_true.append(int(labels[i].item())); y_pred.append(int(np.argmax(probs))); y_prob.append(probs)
-    m = evaluate_classification(y_true, y_pred, np.array(y_prob), num_classes=num_classes)
-    return m, np.array(y_pred)
-
-def evaluate_model_onnx_auto(onnx_path: Path, loader: DataLoader, num_classes: int,
-                             orig_mean: float, orig_std: float,
-                             force_layout: Optional[str] = None,
-                             force_rgb: Optional[bool] = None,
-                             use_imagenet_norm: Optional[bool] = None):
+def run_onnx(onnx_path: Path, task: str, layout_opt: str,
+             rgb: bool, loader1: DataLoader, num_classes: Optional[int]) -> Optional[Dict[str, Any]]:
     try:
-        sess = _load_onnx_session(onnx_path)
+        import onnxruntime as ort
     except Exception as e:
-        print(f"[WARN] Skipping ONNX (cannot open): {onnx_path.name}: {e}")
+        print(f"[WARN] ONNXRuntime not available: {e}")
         return None
-    layout = force_layout or _detect_layout_from_onnx(sess)
-    swap_rgb = bool(force_rgb) if force_rgb is not None else (layout == 'nhwc')
-    norm_mode = 'imagenet' if use_imagenet_norm else 'neg11'
-    m, p = _eval_onnx_once(onnx_path, loader, num_classes, orig_mean, orig_std, layout, swap_rgb, norm_mode)
-    if _degenerate(p, float(m.get("accuracy", 0.0))) and (force_rgb is None or use_imagenet_norm is None or force_layout is None):
-        cands = [(layout, True, 'neg11'), (layout, True, 'imagenet')]
-        if layout == 'nchw':
-            cands += [('nhwc', True, 'neg11'), ('nhwc', True, 'imagenet')]
-        best_m, best = m, (layout, swap_rgb, norm_mode); best_acc = float(m.get("accuracy", 0.0))
-        for cand in cands:
-            m2, _ = _eval_onnx_once(onnx_path, loader, num_classes, orig_mean, orig_std, *cand)
-            acc2 = float(m2.get("accuracy", 0.0))
-            if acc2 > best_acc: best_m, best, best_acc = m2, cand, acc2
-        if best != (layout, swap_rgb, norm_mode):
-            print(f"[INFO] ONNX auto-selected layout={best[0]}, RGB={best[1]}, norm={best[2]} (acc={best_acc:.4f})")
-            m = best_m
-    return m
+    so = ort.SessionOptions(); so.intra_op_num_threads = 1
+    sess = ort.InferenceSession(str(onnx_path), sess_options=so, providers=["CPUExecutionProvider"])
+    layout = _detect_onnx_layout(sess) if layout_opt == "auto" else layout_opt
+    inp = sess.get_inputs()[0].name; out = sess.get_outputs()[0].name
 
+    y_true, y_pred, y_prob = [], [], []
+    y_reg_true, y_reg_pred = [], []
 
-# ===== TF Keras & SavedModel evaluation =====
-def _is_saved_model_dir(p: Path) -> bool:
-    return p.is_dir() and (p / "saved_model.pb").exists()
+    for images, labels in tqdm(loader1, desc=f"[ONNX] {onnx_path.name}", leave=False):
+        x = images[0].cpu().numpy()   # CHW, [-1,1]
+        if layout == "nchw":
+            xin = x[None, ...].astype(np.float32)
+            if rgb:  # BGR->RGB
+                xin = xin[:, ::-1, ...]
+        else:
+            x_hwc = np.transpose(x, (1, 2, 0)).astype(np.float32)
+            if rgb: x_hwc = x_hwc[..., ::-1]
+            xin = x_hwc[None, ...]
+        y = sess.run([out], {inp: xin})[0]
+        if task == "classification":
+            probs = _softmax_np(y)
+            y_true.append(int(labels[0].item()))
+            y_pred.append(int(np.argmax(probs)))
+            y_prob.append(probs.reshape(-1))
+        else:
+            y_reg_true.append(float(labels.view(-1)[0].item()))
+            y_reg_pred.append(float(np.array(y).reshape(-1)[0]))
 
-def _pick_tensor_from_tf_output(out: Any, prefer_key: Optional[str] = None):
-    if isinstance(out, dict):
-        if prefer_key and prefer_key in out: return out[prefer_key]
-        for k in ("logits","predictions","output","outputs","probs","probabilities","Identity","Softmax","dense","dense_1"):
-            if k in out: return out[k]
-        return next(iter(out.values()))
-    return out
+    if task == "classification":
+        y_prob_np = np.vstack(y_prob) if len(y_prob) else np.zeros((0, int(num_classes or 1)))
+        ncls_eff = int(num_classes or (y_prob_np.shape[1] if y_prob_np.size else 1))
+        return evaluate_classification(y_true, y_pred, y_prob_np, ncls_eff)
+    return evaluate_regression(y_reg_true, y_reg_pred)
 
-def _load_tf_model_file(model_path: Path):
-    last_err = None
+def _tflite_interpreter(path: Path):
     try:
-        import tensorflow as tf  # type: ignore
-        with tf.keras.utils.custom_object_scope({'TFOpLambda': tf.keras.layers.Lambda}):
-            # Keras3 互換: safe_mode が存在すれば False に
-            try:
-                return tf.keras.models.load_model(str(model_path), compile=False, safe_mode=False)
-            except TypeError:
-                return tf.keras.models.load_model(str(model_path), compile=False)
-    except Exception as e:
-        last_err = e
-    try:
-        import keras  # type: ignore
-        with keras.utils.custom_object_scope({'TFOpLambda': keras.layers.Lambda}):
-            try:
-                return keras.models.load_model(str(model_path), compile=False, safe_mode=False)
-            except TypeError:
-                return keras.models.load_model(str(model_path), compile=False)
-    except Exception as e:
-        last_err = e
-    raise last_err
-
-def _load_tf_savedmodel_as_layer(saved_dir: Path, call_endpoint: Optional[str] = "serving_default"):
-    """
-    Return a callable (x, **kwargs) -> np.ndarray
-    """
-    import numpy as np
-    try:
-        import keras  # type: ignore
-        from keras.layers import TFSMLayer  # type: ignore
-        layer = TFSMLayer(str(saved_dir), call_endpoint=call_endpoint or "serving_default")
-        def _call(x, **kwargs):
-            y = layer(x)  # training は渡さない（TFSMLayer は未対応のことがある）
-            y = _pick_tensor_from_tf_output(y, None)
-            return np.array(y) if hasattr(y, "numpy") else y
-        return _call
+        from tflite_runtime.interpreter import Interpreter
+        it = Interpreter(model_path=str(path)); it.allocate_tensors(); return it
     except Exception:
-        import tensorflow as tf  # type: ignore
-        sm = tf.saved_model.load(str(saved_dir))
-        fn = sm.signatures.get(call_endpoint or "serving_default", None)
-        if fn is None and len(sm.signatures) > 0:
+        import tensorflow as tf
+        it = tf.lite.Interpreter(model_path=str(path)); it.allocate_tensors(); return it
+
+def run_tflite(tfl: Path, task: str, rgb: bool, loader1: DataLoader, num_classes: Optional[int]) -> Optional[Dict[str, Any]]:
+    try:
+        it = _tflite_interpreter(tfl)
+    except Exception as e:
+        print(f"[WARN] TFLite interpreter not available: {e}")
+        return None
+    in_d = it.get_input_details()[0]; out_d = it.get_output_details()[0]
+    in_idx = in_d["index"]; out_idx = out_d["index"]
+    in_shape = tuple(in_d["shape"])  # [1,H,W,C] or [1,C,H,W]
+    nhwc = (len(in_shape) == 4 and in_shape[-1] in (1,3))
+
+    def _q(x: np.ndarray, d: Dict[str, Any]) -> np.ndarray:
+        if d["dtype"] == np.float32: return x.astype(np.float32)
+        qp = d.get("quantization_parameters", {})
+        scales = qp.get("scales", [1.0]); zeros = qp.get("zero_points", [0])
+        scale, zero = float(scales[0] if len(scales)>0 else 1.0), int(zeros[0] if len(zeros)>0 else 0)
+        xq = np.round(x / (scale if scale!=0 else 1.0) + zero)
+        if d["dtype"] == np.int8:  return np.clip(xq, -128, 127).astype(np.int8)
+        if d["dtype"] == np.uint8: return np.clip(xq, 0, 255).astype(np.uint8)
+        return xq.astype(d["dtype"])
+
+    y_true, y_pred, y_prob = [], [], []
+    y_reg_true, y_reg_pred = [], []
+
+    for images, labels in tqdm(loader1, desc=f"[TFLite] {tfl.name}", leave=False):
+        x = images[0].cpu().numpy()  # CHW, [-1,1]
+        if nhwc:
+            x = np.transpose(x, (1, 2, 0))
+            if rgb: x = x[..., ::-1]
+            x = x[None, ...].astype(np.float32)
+        else:
+            x = x[None, ...].astype(np.float32)
+            if rgb: x = x[:, ::-1, ...]
+        it.set_tensor(in_idx, _q(x, in_d))
+        it.invoke()
+        y = it.get_tensor(out_idx)
+        if task == "classification":
+            probs = _softmax_np(y)
+            y_true.append(int(labels[0].item()))
+            y_pred.append(int(np.argmax(probs)))
+            y_prob.append(probs.reshape(-1))
+        else:
+            y_reg_true.append(float(labels.view(-1)[0].item()))
+            y_reg_pred.append(float(np.array(y).reshape(-1)[0]))
+    if task == "classification":
+        y_prob_np = np.vstack(y_prob) if len(y_prob) else np.zeros((0, int(num_classes or 1)))
+        ncls_eff = int(num_classes or (y_prob_np.shape[1] if y_prob_np.size else 1))
+        return evaluate_classification(y_true, y_pred, y_prob_np, ncls_eff)
+    return evaluate_regression(y_reg_true, y_reg_pred)
+
+def run_keras(model_path: Path, task: str, rgb: bool, loader1: DataLoader, num_classes: Optional[int]) -> Optional[Dict[str, Any]]:
+    try:
+        import tensorflow as tf
+    except Exception as e:
+        print(f"[WARN] TensorFlow not available: {e}")
+        return None
+
+    model = None
+    call = None
+    if _is_saved_model_dir(model_path):
+        sm = tf.saved_model.load(str(model_path))
+        fn = sm.signatures.get("serving_default", None)
+        if fn is None and len(sm.signatures)>0:
             fn = list(sm.signatures.values())[0]
         if fn is None:
-            raise RuntimeError("No callable signature found in SavedModel.")
-        def _call(x, **kwargs):
+            print("[WARN] No callable signature in SavedModel.")
+            return None
+        def call(x):
             y = fn(tf.convert_to_tensor(x))
-            y = _pick_tensor_from_tf_output(y, None)
-            return y.numpy() if hasattr(y, "numpy") else np.array(y)
-        return _call
+            if isinstance(y, dict): y = list(y.values())[0]
+            return y.numpy()
+    else:
+        try:
+            model = tf.keras.models.load_model(str(model_path), compile=False)
+        except Exception:
+            model = tf.keras.models.load_model(str(model_path), compile=False, safe_mode=False)
+        def call(x):
+            y = model(x, training=False)
+            if isinstance(y, dict): y = list(y.values())[0]
+            return y.numpy()
 
-def _eval_tf_once(model_or_callable, loader: DataLoader, num_classes: int,
-                  orig_mean: float, orig_std: float,
-                  swap_rgb: bool, norm_mode: str,
-                  output_key: Optional[str] = None):
-    """
-    model_or_callable: Keras Model もしくは Python callable
-    - まず training=False 付きで呼び、TypeError なら引数なしで再試行
-    """
     y_true, y_pred, y_prob = [], [], []
-    for batch in tqdm(loader, desc=f"TF [{('RGB' if swap_rgb else 'BGR')},{norm_mode}]", leave=False):
-        images, labels = batch[:2]
-        for i in range(images.shape[0]):
-            x_chw = images[i].cpu().numpy()
-            x = _prep_image_from_chw(x_chw, orig_mean, orig_std, swap_rgb, norm_mode)  # HWC
-            x = x[None, ...].astype(np.float32)
-            try:
-                y = model_or_callable(x, training=False)
-            except TypeError:
-                y = model_or_callable(x)
-            y = _pick_tensor_from_tf_output(y, output_key)
-            y = np.array(y)
-            probs = _softmax_np(y.reshape(1, -1))[0]
-            y_true.append(int(labels[i].item())); y_pred.append(int(np.argmax(probs))); y_prob.append(probs)
-    m = evaluate_classification(y_true, y_pred, np.array(y_prob), num_classes=num_classes)
-    return m, np.array(y_pred)
+    y_reg_true, y_reg_pred = [], []
 
-def evaluate_model_tf_auto(model_path: Path, loader: DataLoader, num_classes: int,
-                           orig_mean: float, orig_std: float,
-                           force_rgb: Optional[bool] = None,
-                           use_imagenet_norm: Optional[bool] = None,
-                           call_endpoint: Optional[str] = None,
-                           output_key: Optional[str] = None):
-    try:
-        if _is_saved_model_dir(model_path):
-            model = _load_tf_savedmodel_as_layer(model_path, call_endpoint or "serving_default")
+    for images, labels in tqdm(loader1, desc=f"[TF] {model_path.name}", leave=False):
+        x = images[0].cpu().numpy()  # CHW [-1,1]
+        x = np.transpose(x, (1,2,0))  # -> HWC
+        if rgb: x = x[..., ::-1]
+        y = call(x[None, ...].astype(np.float32))
+        if task == "classification":
+            probs = _softmax_np(y)
+            y_true.append(int(labels[0].item()))
+            y_pred.append(int(np.argmax(probs)))
+            y_prob.append(probs.reshape(-1))
         else:
-            # .h5 / .keras のみ対応。それ以外の拡張子はここに来ない
-            model = _load_tf_model_file(model_path)
-    except Exception as e:
-        print(f"[WARN] Skipping TF model (cannot load): {model_path.name}: {e}")
-        return None
-    swap_rgb = bool(force_rgb) if force_rgb is not None else True  # TF系は基本RGB
-    norm_mode = 'imagenet' if use_imagenet_norm else 'neg11'
-    m, p = _eval_tf_once(model, loader, num_classes, orig_mean, orig_std, swap_rgb, norm_mode, output_key)
-    if _degenerate(p, float(m.get("accuracy", 0.0))) and (force_rgb is None or use_imagenet_norm is None):
-        cands = [(True, 'imagenet'), (True, 'neg11')]
-        best_m, best = m, (swap_rgb, norm_mode); best_acc = float(m.get("accuracy", 0.0))
-        for cand in cands:
-            m2, _ = _eval_tf_once(model, loader, num_classes, orig_mean, orig_std, *cand, output_key)
-            acc2 = float(m2.get("accuracy", 0.0))
-            if acc2 > best_acc: best_m, best, best_acc = m2, cand, acc2
-        if best != (swap_rgb, norm_mode):
-            print(f"[INFO] TF auto-selected RGB={best[0]}, norm={best[1]} (acc={best_acc:.4f})")
-            m = best_m
-    return m
+            y_reg_true.append(float(labels.view(-1)[0].item()))
+            y_reg_pred.append(float(np.array(y).reshape(-1)[0]))
 
+    if task == "classification":
+        y_prob_np = np.vstack(y_prob) if len(y_prob) else np.zeros((0, int(num_classes or 1)))
+        ncls_eff = int(num_classes or (y_prob_np.shape[1] if y_prob_np.size else 1))
+        return evaluate_classification(y_true, y_pred, y_prob_np, ncls_eff)
+    return evaluate_regression(y_reg_true, y_reg_pred)
 
-# ===== Main =====
+# ====== Main ======
 def main():
-    ap = argparse.ArgumentParser(description="Evaluate Torch/TFLite/ONNX/TF models and write metrics to CSV.")
-    ap.add_argument("--config", required=True, help="YAML used in training (experiment format)")
-    ap.add_argument("--weights_dir", required=True, help="Directory containing models")
+    ap = argparse.ArgumentParser(description="Unified simple tester")
+    ap.add_argument("--task", required=True, choices=["classification", "regression"])
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--weights_dir", required=True)
     ap.add_argument("--out_csv", default="test_results.csv")
-    ap.add_argument("--batch_size", type=int, default=None)
+
+    ap.add_argument("--image_size", type=int, default=None, help="Square size (fallback: YAML image_size or 320)")
+    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--num_workers", type=int, default=None, help="None: auto (Windows=0, else=2)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    # Optional hints (TFLite / TF / ONNX)
-    ap.add_argument("--tflite_force_rgb", action="store_true")
-    ap.add_argument("--tflite_imagenet_norm", action="store_true")
-    ap.add_argument("--tf_force_rgb", action="store_true")
-    ap.add_argument("--tf_imagenet_norm", action="store_true")
-    ap.add_argument("--tf_call_endpoint", default="serving_default",
-                    help="SavedModel call endpoint name for TFSMLayer (default: serving_default)")
-    ap.add_argument("--tf_output_key", default="",
-                    help="If TF outputs a dict, pick this key if present (default: auto)")
-    ap.add_argument("--onnx_force_rgb", action="store_true")
-    ap.add_argument("--onnx_imagenet_norm", action="store_true")
-    ap.add_argument("--onnx_force_nhwc", action="store_true", help="Force ONNX layout as NHWC (default: auto/NCHW)")
+    ap.add_argument("--num_classes", type=int, default=None, help="classification only (fallback: YAML / infer)")
+
+    ap.add_argument("--mean", type=float, default=0.5)
+    ap.add_argument("--std",  type=float, default=0.5)
+
+    ap.add_argument("--onnx_layout", choices=["auto","nchw","nhwc"], default="auto")
+    ap.add_argument("--tf_rgb",     action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--tflite_rgb", action=argparse.BooleanOptionalAction, default=True)
+
     args = ap.parse_args()
 
-    cfg_list = load_all_training_configs(args.config)
-    if not cfg_list: raise RuntimeError(f"No training configs parsed from: {args.config}")
+    # Load YAML configs
+    cfgs = load_all_training_configs(args.config)
+
+    # Collect model files
+    wdir = Path(args.weights_dir)
+    files = _gather_models(wdir)
+    if not files:
+        print(f"[WARN] no model files under: {wdir}")
+        return
+
+    # Output CSV
+    out_path = Path(args.out_csv); out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_rows: List[Dict[str, Any]] = []
+
+    # workers(auto)
+    if args.num_workers is None:
+        is_win = (platform.system().lower() == "windows")
+        num_workers = 0 if is_win else 2
+    else:
+        num_workers = max(0, int(args.num_workers))
 
     device = torch.device(args.device)
-    out_rows: List[Dict[str, Any]] = []
-    out_csv = Path(args.out_csv); out_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    wdir = Path(args.weights_dir)
-    # gather files
-    model_paths: List[Path] = []
-    model_paths += sorted(list(wdir.glob("*.pth")) + list(wdir.glob("*.pt")))
-    model_paths += sorted(list(wdir.glob("*.tflite")))
-    model_paths += sorted(list(wdir.glob("*.onnx")))
-    model_paths += sorted(list(wdir.glob("*.h5")) + list(wdir.glob("*.keras")))
-    # SavedModel directoriesのみ追加
-    model_paths += sorted([p for p in wdir.iterdir() if _is_saved_model_dir(p)])
+    for mpath in files:
+        stem = mpath.stem  # extension removed; dots in name remain
+        cfg = _pick_cfg(cfgs, args.task, stem)
 
-    if not model_paths:
-        print(f"[WARN] No model found in: {wdir}")
-
-    for mpath in model_paths:
-        suffix = mpath.suffix.lower()
-        # ===== Choose config =====
-        chosen_cfg = None; ckpt = None
-        if suffix in [".pth", ".pt"]:
-            ckpt = torch.load(str(mpath), map_location="cpu")
-            chosen_cfg = pick_cfg_for_ckpt(cfg_list, ckpt) or cfg_list[0]
+        # image size
+        if args.image_size is not None:
+            H = W = int(args.image_size)
         else:
-            chosen_cfg = cfg_list[0]
+            img_sz = getattr(cfg, "image_size", (320, 320))
+            H = int(img_sz[0] if isinstance(img_sz, (list,tuple)) else img_sz)
+            W = int(img_sz[1] if isinstance(img_sz, (list,tuple)) else img_sz)
+        size_hw = (H, W)
 
-        # ===== Dataset / Loaders =====
-        image_size = tuple(getattr(chosen_cfg, "image_size", (480, 480)))
-        mean = float(getattr(chosen_cfg, "normalize_mean", 0.5)) if hasattr(chosen_cfg, "normalize_mean") else 0.5
-        std  = float(getattr(chosen_cfg, "normalize_std", 0.5))  if hasattr(chosen_cfg, "normalize_std")  else 0.5
-        tfm = SimpleTransform(size_hw=image_size, mean=mean, std=std)
-
-        valid_csv = getattr(chosen_cfg, "valid_file_dir", None)
-        valid_img_dir = getattr(chosen_cfg, "valid_img_dir", "")
-        if valid_csv is None or not Path(valid_csv).exists():
-            raise FileNotFoundError(f"valid_file_dir not found in cfg: {valid_csv}")
-
-        ds = SignalMixClassificationDataset(img_dir=valid_img_dir, annotation_csv=valid_csv, transform=tfm)
-
-        bs = args.batch_size or int(getattr(chosen_cfg, "batch_size", 16))
-        pin = (device.type == "cuda")
-        loader_torch = DataLoader(ds, batch_size=bs, shuffle=False,
-                                  num_workers=int(getattr(chosen_cfg, "num_workers", 4)),
-                                  pin_memory=pin, collate_fn=signalmix_collate, drop_last=False)
-        loader1 = DataLoader(ds, batch_size=1, shuffle=False,
-                             num_workers=int(getattr(chosen_cfg, "num_workers", 2)),
-                             pin_memory=False, collate_fn=signalmix_collate, drop_last=False)
-
-        num_classes = int(getattr(chosen_cfg, "num_classes", getattr(ds, "num_classes", 3)))
-        task = "classification"  # SignalMix is classification
-
-        # ===== Evaluate by type =====
-        row = {"model_file": mpath.name, "model_name": getattr(chosen_cfg, "model_name", mpath.stem), "task": task}
-
-        if suffix in [".pth", ".pt"]:
-            model, task_eff, ncls_eff, model_name = build_model_from_cfg_via_builder(chosen_cfg, ckpt, getattr(ds,"num_classes",None))
-            model = model.to(device); load_state_dict_safely(model, ckpt)
-            metrics = evaluate_model_torch(model, loader_torch, device, task_eff, ncls_eff)
-            row["model_name"] = model_name
-            row.update(metrics)
-            print(f"[OK][Torch] {mpath.name} -> acc: {row.get('accuracy','NA')}")
-
-        elif suffix == ".tflite":
-            metrics = evaluate_model_tflite_auto(
-                tflite_path=mpath, loader=loader1, num_classes=num_classes,
-                orig_mean=mean, orig_std=std,
-                force_rgb=args.tflite_force_rgb if hasattr(args, "tflite_force_rgb") else None,
-                use_imagenet_norm=args.tflite_imagenet_norm if hasattr(args, "tflite_imagenet_norm") else None
+        # datasets
+        if args.task == "classification":
+            ds = SignalMixClassificationDataset(
+                img_dir=getattr(cfg, "valid_img_dir", ""),
+                annotation_csv=getattr(cfg, "valid_file_dir", ""),
+                transform=EvalTransform(size_hw, args.mean, args.std),
+                is_train=False
             )
-            if metrics is None: metrics = {}
+            ncls = int(args.num_classes or getattr(cfg, "num_classes", getattr(ds, "num_classes", 3)))
+        else:
+            ds = SignalSlopeDataset(
+                csv_path=getattr(cfg, "valid_file_dir", ""),
+                image_dir=getattr(cfg, "valid_img_dir", ""),
+                task="regression",
+                transform=RegrTransformAdapter(size_hw, args.mean, args.std),
+                shuffle=False
+            )
+            ncls = 0
+
+        # loaders
+        pin = device.type == "cuda"
+        loader_bs = DataLoader(ds, batch_size=max(1, args.batch_size), shuffle=False,
+                               num_workers=num_workers, pin_memory=pin, collate_fn=_collate_xy)
+        loader_1  = DataLoader(ds, batch_size=1, shuffle=False,
+                               num_workers=num_workers, pin_memory=False, collate_fn=_collate_xy)
+
+        row: Dict[str, Any] = {
+            "model_file": mpath.name,
+            "task": args.task,
+            "model_name": getattr(cfg, "model_name", "")
+        }
+
+        suffix = mpath.suffix.lower()
+        if suffix in [".pth", ".pt"]:
+            metrics = run_pytorch(mpath, args.task, cfg, ncls, device, loader_bs)
             row.update(metrics or {})
-            print(f"[OK][TFLite] {mpath.name} -> acc: {row.get('accuracy','NA')}")
+            print(f"[OK][Torch] {mpath.name}  ->  {row}")
 
         elif suffix == ".onnx":
-            try:
-                import onnxruntime  # noqa: F401
-            except Exception as e:
-                print(f"[WARN] ONNXRuntime not available, skipping {mpath.name}: {e}")
-                continue
-            metrics = evaluate_model_onnx_auto(
-                onnx_path=mpath, loader=loader1, num_classes=num_classes,
-                orig_mean=mean, orig_std=std,
-                force_layout=('nhwc' if args.onnx_force_nhwc else None),
-                force_rgb=args.onnx_force_rgb if hasattr(args, "onnx_force_rgb") else None,
-                use_imagenet_norm=args.onnx_imagenet_norm if hasattr(args, "onnx_imagenet_norm") else None
-            )
-            if metrics is None: metrics = {}
+            metrics = run_onnx(mpath, args.task, args.onnx_layout, rgb=False, loader1=loader_1, num_classes=ncls if ncls else None)
             row.update(metrics or {})
-            print(f"[OK][ONNX] {mpath.name} -> acc: {row.get('accuracy','NA')}")
+            print(f"[OK][ONNX]  {mpath.name}  ->  {row}")
+
+        elif suffix == ".tflite":
+            metrics = run_tflite(mpath, args.task, rgb=args.tflite_rgb, loader1=loader_1, num_classes=ncls if ncls else None)
+            row.update(metrics or {})
+            print(f"[OK][TFL]   {mpath.name}  ->  {row}")
 
         elif suffix in [".h5", ".keras"] or _is_saved_model_dir(mpath):
-            # TF: Keras(.h5/.keras) or SavedModel dir のみ対応
-            try:
-                import tensorflow as tf  # noqa: F401
-            except Exception as e:
-                print(f"[WARN] TensorFlow not available, skipping {mpath.name}: {e}")
-                continue
-            metrics = evaluate_model_tf_auto(
-                model_path=mpath, loader=loader1, num_classes=num_classes,
-                orig_mean=mean, orig_std=std,
-                force_rgb=args.tf_force_rgb if hasattr(args, "tf_force_rgb") else None,
-                use_imagenet_norm=args.tf_imagenet_norm if hasattr(args, "tf_imagenet_norm") else None,
-                call_endpoint=args.tf_call_endpoint if hasattr(args, "tf_call_endpoint") else "serving_default",
-                output_key=args.tf_output_key if hasattr(args, "tf_output_key") and args.tf_output_key else None
-            )
-            if metrics is None: metrics = {}
+            metrics = run_keras(mpath, args.task, rgb=args.tf_rgb, loader1=loader_1, num_classes=ncls if ncls else None)
             row.update(metrics or {})
-            print(f"[OK][TF] {mpath.name} -> acc: {row.get('accuracy','NA')}")
+            print(f"[OK][TF]    {mpath.name}  ->  {row}")
 
         else:
-            print(f"[WARN] Unsupported file type, skipping: {mpath.name}")
+            print(f("[SKIP] Unsupported: {mpath.name}"))
             continue
 
         out_rows.append(row)
 
-    # ===== Write CSV =====
-    if out_rows:
-        keys = list(sorted({k for r in out_rows for k in r.keys()}))
-        head = ["model_file", "model_name", "task"] + [k for k in keys if k not in ("model_file","model_name","task")]
-        with open(out_csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=head); w.writeheader()
-            for r in out_rows: w.writerow({k: r.get(k, "") for k in head})
-    else:
-        with open(out_csv, "w", newline="", encoding="utf-8") as f:
-            f.write("model_file,model_name,task\n")
-    print(f"[DONE] wrote: {out_csv.resolve()}")
-
+    # write CSV
+    keys = sorted({k for r in out_rows for k in r.keys()})
+    head = ["model_file", "model_name", "task"] + [k for k in keys if k not in ("model_file","model_name","task")]
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=head)
+        w.writeheader()
+        for r in out_rows:
+            w.writerow({k: (r.get(k, "").tolist() if hasattr(r.get(k, ""), "tolist") else r.get(k, "")) for k in head})
+    print(f"[DONE] wrote: {out_path.resolve()}")
 
 if __name__ == "__main__":
     main()
