@@ -1,0 +1,39 @@
+experiment:
+  task: segmentation
+  epochs: 1
+  batch_size: 8
+  image_size: [320, 320]
+  learning_rate: 3.0e-4
+  weight_decay: 1.0e-4
+  patience: 10
+  min_delta: 0.001
+
+  # データパス（画像/マスク）
+  train_img_dir:  "D:/Datasets/WithCross Dataset/seg/train/images"
+  valid_img_dir:  "D:/Datasets/WithCross Dataset/seg/valid/images"
+  train_mask_dir: "D:/Datasets/WithCross Dataset/seg/train/masks"
+  valid_mask_dir: "D:/Datasets/WithCross Dataset/seg/valid/masks"
+  # （任意）CSVに filename 列があるなら train_file_dir/valid_file_dir に指定可
+
+  # クラス数と前処理
+  num_classes: 2
+  normalize_mean: 0.5
+  normalize_std: 0.5
+
+  # DataLoader
+  num_workers: 4
+  prefetch_factor: 2
+
+  # 損失（CE推奨）
+  LOSS:
+    name: ce         # 任意。実際の計算は train_ddp 側でCEを適用
+    ignore_index: 255
+    # class_weights: [1.0, 1.0]   # 不均衡なら指定
+
+  AUGMENTATION:
+    name: none       # segmentation では mix 系は既定で無効
+
+  models:
+    - name: edgenext  # models/segmentation/edgenext.py
+      dropout_rate: 0.0
+      drop_path_rate: 0.0

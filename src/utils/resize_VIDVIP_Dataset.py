@@ -59,8 +59,8 @@ def collect_label_files(root: Path) -> list[Path]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Extract class-13 images, pad & resize.")
-    parser.add_argument("--src",  type=Path, default=r"D:\Datasets\VIDVIP")
-    parser.add_argument("--dst",  type=Path, default=r"D:\Datasets\WithCross Dataset\vidvip/")
+    parser.add_argument("--src",  type=Path, default=r"C:\Users\shinj\Projects\WithCross\data\image")
+    parser.add_argument("--dst",  type=Path, default=r"C:\Users\shinj\Projects\WithCross\data\dst")
     args = parser.parse_args()
 
     if not args.src.is_dir():

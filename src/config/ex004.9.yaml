@@ -1,11 +1,15 @@
+# 差分
+# カスタムデータを1449枚追加
+# カスタムデータを1800枚追加
+
 experiment:
-  epochs:         500
-  batch_size:     1
+  epochs:         200
+  batch_size:     32
   image_size:     [224, 224]
   learning_rate:  5e-5
   weight_decay:   0.05
   patience:       30
-  min_delta:      1e-4
+  min_delta:      1e-5
   task:           "classification"
   num_classes:    3
 
@@ -15,11 +19,12 @@ experiment:
   cutmix_alpha:     0.0
   drop_path_rate:   0.3
   max_norm:         1.0
+  replace_large_kernel: false
 
   train_file_dir: data/csv/train.csv
-  valid_file_dir: data/csv/test.csv
-  train_img_dir: data/image
-  valid_img_dir: "D:/Datasets/WithCross Dataset/image"
+  valid_file_dir: data/csv/valid.csv
+  train_img_dir: D:\Datasets\WithCross Dataset\image
+  valid_img_dir: D:\Datasets\WithCross Dataset\image
 
   AUGMENTATION:
     name: none # none | signalmix
@@ -31,26 +36,18 @@ experiment:
     max_lam: 0.65
     protect_radius: 50     # ← CutMix 後に保護する半径(px)
     max_trials: 25         # ← 非交差矩形が見つかるまでの試行回数
-    signal_dir: data/vidvip_signal/signal
-    signal_csv: data/vidvip_signal/signal.csv
+    signal_dir: D:\Datasets\WithCross Dataset\vidvip_signal/signal
+    signal_csv: D:\Datasets\WithCross Dataset\vidvip_signal/signal.csv
     none_index: 0
+    transform : albumentation
 
   LOSS:
-    name: "weighted_ce"      # "ce" / "weighted_ce" / "focal"
+    name: "focal"      # "ce" / "weighted_ce" / "focal"
     apply_class_balance: true
     beta: 0.99               # 有効サンプル数 β
-    label_smoothing: 0.3
+    label_smoothing: 0.0
 
   models:
-    - name: edgenext_base.s_bn_hs   
-      image_size: [320, 320]                   
-    - name: edgenext_base.s_bn_hs_hr   
-      image_size: [320, 320]    
-    - name: edgenext_base.s_bn_hs_hr   
-      image_size: [320, 320]     
-    - name: edgenext_base.b_tanh   
-      image_size: [320, 320]     
-    - name: edgenext_base.b_tanh_hr   
-      image_size: [320, 320]   
     - name: edgenext_base.b_tanh_hr_cdw  
-      image_size: [320, 320]   
+      image_size: [320, 320]                           
+

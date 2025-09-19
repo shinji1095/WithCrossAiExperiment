@@ -45,6 +45,7 @@ class TrainingConfig:
         self.valid_file_dir = cfg.get('valid_file_dir', self.valid_file_dir)
         self.train_img_dir  = cfg.get('train_img_dir',  self.train_img_dir)
         self.valid_img_dir  = cfg.get('valid_img_dir',  self.valid_img_dir)
+        self.replace_large_kernel = cfg.get('replace_large_kernel', False)
 
         # ----- segmentation 追加（未指定なら None / 既存には無害） -----
         self.num_classes     = int(cfg.get('num_classes', 3))
@@ -96,6 +97,7 @@ class TrainingConfig:
             _aug_default.setdefault('signal_csv',  r'D:\Datasets\WithCross Dataset\vidvip_signal/signal.csv')
             _aug_default.setdefault('none_index',  0)
             _aug_default.setdefault('use_cutmix',  True)
+            _aug_default.setdefault('transform',  "simple")
         self.AUGMENTATION = _aug_default
 
         # wandb（互換）

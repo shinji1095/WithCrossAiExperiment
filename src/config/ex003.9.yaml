@@ -1,6 +1,9 @@
+# 差分
+# カスタムデータを1449枚追加
+
 experiment:
   epochs:         500
-  batch_size:     1
+  batch_size:     32
   image_size:     [224, 224]
   learning_rate:  5e-5
   weight_decay:   0.05
@@ -16,10 +19,10 @@ experiment:
   drop_path_rate:   0.3
   max_norm:         1.0
 
-  train_file_dir: data/csv/train.csv
-  valid_file_dir: data/csv/test.csv
-  train_img_dir: data/image
-  valid_img_dir: "D:/Datasets/WithCross Dataset/image"
+  train_file_dir: data/train.csv
+  valid_file_dir: data/valid.csv
+  train_img_dir: D:\Datasets\WithCross Dataset\image
+  valid_img_dir: D:\Datasets\WithCross Dataset\image
 
   AUGMENTATION:
     name: none # none | signalmix
@@ -31,8 +34,8 @@ experiment:
     max_lam: 0.65
     protect_radius: 50     # ← CutMix 後に保護する半径(px)
     max_trials: 25         # ← 非交差矩形が見つかるまでの試行回数
-    signal_dir: data/vidvip_signal/signal
-    signal_csv: data/vidvip_signal/signal.csv
+    signal_dir: D:\Datasets\WithCross Dataset\vidvip_signal/signal
+    signal_csv: D:\Datasets\WithCross Dataset\vidvip_signal/signal.csv
     none_index: 0
 
   LOSS:
@@ -42,15 +45,10 @@ experiment:
     label_smoothing: 0.3
 
   models:
-    - name: edgenext_base.s_bn_hs   
+    - name: edgenext_base.usi_in1k   
       image_size: [320, 320]                   
-    - name: edgenext_base.s_bn_hs_hr   
-      image_size: [320, 320]    
-    - name: edgenext_base.s_bn_hs_hr   
-      image_size: [320, 320]     
-    - name: edgenext_base.b_tanh   
-      image_size: [320, 320]     
-    - name: edgenext_base.b_tanh_hr   
-      image_size: [320, 320]   
-    - name: edgenext_base.b_tanh_hr_cdw  
-      image_size: [320, 320]   
+    # - name: hgnetv2_b3.ssld_stage2_ft_in1k
+    #   image_size: [288, 288]        
+    # - name: tf_efficientnet_b4.ap_in1k
+    #   image_size: [380, 380]          
+
