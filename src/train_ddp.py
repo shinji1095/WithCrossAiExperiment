@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import sys
 import time
@@ -5,9 +6,11 @@ import json
 import random
 import logging
 import datetime
-from typing import Dict, Any
+import platform
+from typing import Any, List
 
 import torch
+from torch.amp import GradScaler
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -18,755 +21,609 @@ from torch.utils.tensorboard import SummaryWriter
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-
-# ---------------- third‑party utils -----------------
 from sklearn.metrics import accuracy_score
-import wandb  # ⬅️  NEW: Weights & Biases
+import wandb
 
-# ------------------- project utils ------------------
+# ==== project ====
 from loss.loss import get_loss_fn
 from models.model import get_model
 from config.config import load_all_training_configs
-from dataset import SignalSlopeDataset
+from dataset import SignalSlopeDataset, SimpleTransform, AlbumentationTransform
 from dataset_signalmix import SignalMixClassificationDataset
-from dataloader import AlbumentationTransform
 from metrics.metrics import evaluate_classification, evaluate_regression
 from mixer.advanced_mixers import get_mixer
 from utils.visualize import write_tensorboard
 from utils.early_stopping import EarlyStopping
-from dataloader import SegmentationDataset, SegmentationAugment  # ← 追加
-from models.segmentation_model_factory import create_segmentation_model
 
-# --------- helpers ---------
-def _is_dist():
+from dataloader import SegmentationDataset, SegmentationAugment  # type: ignore
+from models.segmentation_model_factory import create_segmentation_model  # type: ignore
+
+
+# -------------------------------------------------
+# Small helpers
+# -------------------------------------------------
+def _is_dist() -> bool:
     return dist.is_available() and dist.is_initialized()
 
-def _get_world_size():
-    return dist.get_world_size() if _is_dist() else 1
-
-def _get_rank():
+def _rank() -> int:
     return dist.get_rank() if _is_dist() else 0
 
-def _num_classes_from_cfg(cfg, default=3):
-    return int(getattr(cfg, "num_classes", default))
+def _world() -> int:
+    return dist.get_world_size() if _is_dist() else 1
 
-def _to_index_labels(y):
-    """
-    y: (B,) int もしくは (B,C) one-hot/prob
-    -> (B,) int
-    """
-    if y.ndim == 1:
-        return y
-    return torch.argmax(y, dim=1)
+def _is_main() -> bool:
+    return _rank() == 0
 
-def _distributed_sums(device, loss_sum, correct_sum, sample_sum):
-    """
-    全プロセスで合計を加算して返す
-    """
-    if not _is_dist():
-        return loss_sum, correct_sum, sample_sum
-    t = torch.tensor([loss_sum, correct_sum, sample_sum], dtype=torch.float64, device=device)
-    dist.all_reduce(t, op=dist.ReduceOp.SUM)
-    return t[0].item(), t[1].item(), t[2].item()
-
-def signalmix_collate(batch):
-    """
-    batch: [(img(C,H,W), label:int, bboxes:list[xyxy]), ...]
-    -> (imgs(B,3,H,W), labels(B,), bboxes:list[list[xyxy]])
-    """
-    imgs, labels, bboxes = zip(*batch)  # 長さBのタプル
-    imgs = torch.stack(imgs, dim=0)
-    labels = torch.as_tensor(labels, dtype=torch.long)
-    return imgs, labels, list(bboxes)
-
-# -------------------------------------------------
-# DDP utility
-# -------------------------------------------------
+def _env_sanity_log(logger: logging.Logger):
+    if not _is_main():
+        return
+    logger.info(
+        f"[ENV] pid={os.getpid()} "
+        f"torch={torch.__version__} cuda={torch.version.cuda} "
+        f"device_count={torch.cuda.device_count()} "
+        f"os={platform.system()}-{platform.release()}"
+    )
+    for k in ["CUDA_VISIBLE_DEVICES","OMP_NUM_THREADS","MKL_NUM_THREADS","TRAIN_CONFIG_PATH"]:
+        if os.getenv(k) is not None:
+            logger.info(f"[ENV] {k}={os.getenv(k)}")
 
 def setup_ddp(rank: int, world_size: int):
-    """Initialize torch.distributed."""
     if rank == 0:
         print(f"[DDP] master = {os.getenv('MASTER_ADDR')}:{os.getenv('MASTER_PORT')}")
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
-
+    dist.barrier()
 
 def cleanup_ddp():
-    """Terminate torch.distributed."""
-    dist.destroy_process_group()
-
-
-# -------------------------------------------------
-# GPU memory utility
-# -------------------------------------------------
+    if _is_dist():
+        try:
+            dist.barrier()
+        except Exception:
+            pass
+        dist.destroy_process_group()
 
 def free_gpu_memory(*objs):
     for o in objs:
         del o
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
-
-# -------------------------------------------------
-# DataLoader factory
-# -------------------------------------------------
-
-
-# ===== 追加: シンプルな前処理 Transform =====
-class SimpleTransform:
+def signalmix_collate(batch):
     """
-    dataset_signalmix.SignalMixClassificationDataset が期待する
-    .base_transform(image=...) -> {'image': torch.Tensor} 形式の軽量Transform。
-    - optional resize to (H,W)
-    - ToTensor (CHW, float32, 0..1)
-    - Normalize: (x - mean)/std  ← SignalMixのパッチ（-1..1）と整合
+    Robust collate for (img, label) or (img, label, bboxes).
+    - bboxes が無いサンプルは [] で埋める
+    - 画像テンソル形状の不一致を検出してエラーメッセージ化
     """
-    def __init__(self, size_hw=None, mean=0.5, std=0.5):
-        self.size_hw = tuple(size_hw) if size_hw is not None else None  # (H, W)
-        self.mean = float(mean)
-        self.std = float(std)
-
-    def base_transform(self, image):
-        import cv2
-        import torch
-        if self.size_hw is not None:
-            H, W = self.size_hw
-            image = cv2.resize(image, (W, H), interpolation=cv2.INTER_LINEAR)
-        t = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
-        t = (t - self.mean) / self.std
-        return {"image": t}
+    imgs, labels, bboxes_all = [], [], []
+    for i, sample in enumerate(batch):
+        if not isinstance(sample, (list, tuple)) or len(sample) < 2:
+            raise RuntimeError(f"Unexpected sample format at idx {i}: {type(sample)}")
+        img = sample[0]
+        lab = sample[1]
+        bbx = sample[2] if len(sample) >= 3 else []
+        imgs.append(img)
+        labels.append(int(lab))
+        bboxes_all.append(bbx)
+    # 形状チェック（ここで揃っていないと後段で積めない）
+    first_shape = tuple(imgs[0].shape)
+    for i, t in enumerate(imgs):
+        if tuple(t.shape) != first_shape:
+            raise RuntimeError(f"Image shape mismatch in batch: {first_shape} vs {tuple(t.shape)} at local idx {i}")
+    return torch.stack(imgs, 0), torch.as_tensor(labels, dtype=torch.long), bboxes_all
 
 def _worker_init_fn(worker_id: int):
-    """DataLoader worker の起動時に呼ばれる。乱数・スレッド数を抑制して起動を安定化。"""
-    import os
-    import random
-    import numpy as np
+    """各 DataLoader worker 起動時に呼ばれる。乱数/スレッド数を抑制。"""
     try:
         import cv2
-        cv2.setNumThreads(0)  # OpenCV の内部スレッドを無効化（ワーカー多重起動と相性悪い）
+        cv2.setNumThreads(0)  # OpenCV 内部スレッド無効化
     except Exception:
         pass
-    # 各ワーカーで決定的乱数（必要なら）
     seed = (torch.initial_seed() + worker_id) % 2**32
     random.seed(seed)
     np.random.seed(seed)
-    # BLAS / OMP 過剰スレッド抑制
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 
-def get_dataloaders(cfg, rank, world_size):
-    train_sampler = None
-    # === segmentation 分岐を追加 ===
-    if str(cfg.task).lower() == "segmentation":
-        tfm_train = SegmentationAugment(
-            image_size=tuple(getattr(cfg, "image_size", (320,320))),
-            mean=float(getattr(cfg, "normalize_mean", 0.5)),
-            std=float(getattr(cfg, "normalize_std", 0.5)),
-        )
-        tfm_val = SegmentationAugment(
-            image_size=tuple(getattr(cfg, "image_size", (320,320))),
-            mean=float(getattr(cfg, "normalize_mean", 0.5)),
-            std=float(getattr(cfg, "normalize_std", 0.5)),
-        )
+# -------------------------------------------------
+# Dataloaders (with robust logging & timeouts)
+# -------------------------------------------------
+def _build_loader(dataset, batch_size: int, sampler, num_workers: int, logger: logging.Logger, collate_fn=None) -> DataLoader:
+    dl_timeout = 0 if num_workers == 0 else 120
+    persistent_ok = (num_workers > 0) and (platform.system() != "Windows")
+    kwargs = dict(
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+        worker_init_fn=_worker_init_fn,
+        timeout=dl_timeout,           
+    )
+    if persistent_ok:
+        kwargs.update(dict(persistent_workers=True, prefetch_factor=2))
+    if collate_fn is not None:
+        kwargs["collate_fn"] = collate_fn
+    logger.info(f"[Loader] bs={batch_size}, num_workers={num_workers}, "
+                f"persistent={persistent_ok}, timeout={dl_timeout}s")
+    return DataLoader(dataset, **kwargs)
 
+def get_dataloaders(cfg, rank, world_size, logger: logging.Logger):
+    """
+    既存仕様を保ちつつ、OS毎の安全な既定値・詳細ログ・timeout を付与。
+    """
+    is_windows = (platform.system() == "Windows")
+    default_workers = 0 if is_windows else 4
+    num_workers = int(getattr(cfg, "num_workers", default_workers))
+    image_size = tuple(getattr(cfg, "image_size", (320, 320)))
+    mean = float(getattr(cfg, "normalize_mean", 0.5)) if hasattr(cfg, "normalize_mean") else 0.5
+    std  = float(getattr(cfg, "normalize_std", 0.5))  if hasattr(cfg, "normalize_std")  else 0.5
+
+    task = str(getattr(cfg, "task", "classification")).lower()
+    logger.info(f"[Data] task={task}, image_size={image_size}, mean/std=({mean},{std}), num_workers={num_workers}")
+
+    if task == "segmentation":
+        tfm = SegmentationAugment(image_size=image_size, mean=mean, std=std)
         train_ds = SegmentationDataset(
             img_dir=cfg.train_img_dir,
             mask_dir=cfg.train_mask_dir,
             list_csv=getattr(cfg, "train_file_dir", None),
-            transform=tfm_train,
+            transform=tfm,
             num_classes=getattr(cfg, "num_classes", None),
         )
         valid_ds = SegmentationDataset(
             img_dir=cfg.valid_img_dir,
             mask_dir=cfg.valid_mask_dir,
             list_csv=getattr(cfg, "valid_file_dir", None),
-            transform=tfm_val,
+            transform=tfm,
             num_classes=getattr(cfg, "num_classes", None),
         )
 
-    else:
-        train_ds = SignalMixClassificationDataset(
-            img_dir=cfg.train_img_dir,
-            annotation_csv=cfg.train_file_dir,
-            transform=SimpleTransform(),
-            is_train=True
-        )      
-        valid_ds = SignalMixClassificationDataset(
-            img_dir=cfg.valid_img_dir,
-            annotation_csv=cfg.valid_file_dir,
-            transform=SimpleTransform(),
-            is_train=False
-        )
-        train_sampler = torch.utils.data.distributed.DistributedSampler(
-            train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False
-        )
-        valid_sampler = torch.utils.data.distributed.DistributedSampler(
-            valid_ds, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
-        )
+        logger.info(f"[Data] train_ds={len(train_ds)} images, valid_ds={len(valid_ds)} images")
 
-        import platform
-        default_workers = 0 if platform.system() == "Windows" else 4
-        num_workers = int(getattr(cfg, "num_workers", default_workers))
-        loader_common_kwargs = dict(
-            pin_memory=True, drop_last=False, worker_init_fn=_worker_init_fn,
-        )
-        if num_workers > 0:
-            loader_common_kwargs.update(
-                dict(persistent_workers=True, prefetch_factor=getattr(cfg, "prefetch_factor", 2))
-            )
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False)
+        valid_sampler = DistributedSampler(valid_ds, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
 
-        train_loader = torch.utils.data.DataLoader(train_ds, batch_size=cfg.batch_size, sampler=train_sampler,
-            num_workers=num_workers, **loader_common_kwargs
-        , collate_fn=signalmix_collate)
-        valid_loader = torch.utils.data.DataLoader(valid_ds, batch_size=cfg.batch_size, sampler=valid_sampler,
-            num_workers=num_workers, **loader_common_kwargs
-        , collate_fn=signalmix_collate)
+        train_loader = _build_loader(train_ds, cfg.batch_size, train_sampler, num_workers, logger)
+        valid_loader = _build_loader(valid_ds, cfg.batch_size, valid_sampler, num_workers, logger)
+        return train_loader, valid_loader, train_sampler
+    
+    # ---- classification / multitask / regression ----
+    tfm_type = cfg.AUGMENTATION.get("transform", "simple")
+    logger.info(f"[Tfm] transformer={tfm_type}")
+    if tfm_type == "simple":
+        tfm = SimpleTransform(size_hw=image_size, mean=mean, std=std)
+    elif tfm_type == "albumentation":
+        tfm = AlbumentationTransform(size_hw=image_size)
+        
+    train_ds = SignalMixClassificationDataset(
+        img_dir=cfg.train_img_dir, annotation_csv=cfg.train_file_dir, transform=tfm, is_train=True
+    )
+    valid_ds = SignalMixClassificationDataset(
+        img_dir=cfg.valid_img_dir, annotation_csv=cfg.valid_file_dir, transform=tfm, is_train=False
+    )
+    logger.info(f"[Data] train_ds={len(train_ds)} images, valid_ds={len(valid_ds)} images")
+
+    train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False)
+    valid_sampler = DistributedSampler(valid_ds, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+
+    train_loader = _build_loader(train_ds, cfg.batch_size, train_sampler, num_workers, logger,
+                                 collate_fn=signalmix_collate)
+    valid_loader = _build_loader(valid_ds, cfg.batch_size, valid_sampler, num_workers, logger,
+                                 collate_fn=signalmix_collate)
+
     return train_loader, valid_loader, train_sampler
 
 
 # -------------------------------------------------
-# Training helpers (AMP) — FIXED & COMPLETE
+# Train / Validate (AMP + robust logs)
 # -------------------------------------------------
-from typing import Any, Dict, List, Tuple
-import numpy as np
-import torch
-import torch.nn.functional as F
-import torch.distributed as dist
-from tqdm import tqdm
-
-def _is_main_process() -> bool:
-    return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
-
-
 def train_one_epoch(
-    model,
-    loader,
-    optimizer,
-    scaler,
-    loss_fn,
-    device,
-    task: str,
-    mixer,                # None | callable; SignalMix は needs_bboxes 属性あり
-    num_classes: int,
-    cfg,
-    logger,
+    model, loader, optimizer, scaler, loss_fn, device,
+    task: str, mixer, num_classes: int, cfg, logger: logging.Logger,
 ):
-    """
-    - 分類: mixer が有効なら one-hot soft targets を用いた soft-CE を使用
-      → accuracy は mixer で書き換えられたターゲット（y_soft の argmax）で算出
-    - マルチタスク/回帰: 既存仕様を維持
-    - DDP rank 安全化 / AMP / NaN ガードは元の動作を踏襲
-    """
     model.train()
     total_loss, correct, total = 0.0, 0, 0
-
     use_mixer = mixer is not None and str(cfg.AUGMENTATION.get("name", "none")).lower() != "none"
-    pbar_disable = not _is_main_process()
+    pbar_disable = not _is_main()
+    desc = f"Training[R{_rank()}]"
 
     seg_ignore = int(cfg.LOSS.get("ignore_index", 255))
     seg_w = cfg.LOSS.get("class_weights", None)
     seg_weight = torch.tensor(seg_w, dtype=torch.float32, device=device) if (task=="segmentation" and seg_w) else None
 
+    t_iter = time.time()
+    for ib, batch in enumerate(tqdm(loader, desc=desc, disable=pbar_disable)):
+        try:
+            def to_dev(x): return x.to(device, non_blocking=True) if torch.is_tensor(x) else x
 
-    for batch in tqdm(loader, desc="Training", disable=pbar_disable):
-        # -------------------------
-        # Unpack batch safely
-        # -------------------------
-        # 期待される形式:
-        #  - 分類 (SignalMix DS): (imgs, labels_idx, bboxes)
-        #  - 分類 (標準DS):       (imgs, labels_idx)
-        #  - マルチタスク:        (imgs, cls_labels, slope_targets)
-        #  - 回帰:                (imgs, targets)
-        def to_dev(x):
-            return x.to(device, non_blocking=True) if torch.is_tensor(x) else x
+            # --- unpack (タスク別に可変) ---
+            if isinstance(batch, (list, tuple)):
+                batch = list(batch)
+            else:
+                batch = [batch]
+            images = to_dev(batch[0])
 
-        if isinstance(batch, (list, tuple)):
-            batch = list(batch)
-        else:
-            batch = [batch]
-
-        # 画像テンソル
-        images = to_dev(batch[0])
-
-        # 2番目以降はタスクにより可変
-        cls_labels = None
-        slope_targets = None
-        bboxes = None
-
-        if task == "multitask":
-            # (imgs, cls_labels, slope_targets)
-            cls_labels = to_dev(batch[1])
-            slope_targets = to_dev(batch[2])
-        elif task == "classification":
-            cls_labels = to_dev(batch[1])
-            # bboxes があればそのまま（list のまま）使う
-            if len(batch) > 2 and not torch.is_tensor(batch[2]):
-                bboxes = batch[2]
-        else:  # regression
-            # (imgs, targets)
-            slope_targets = to_dev(batch[1])
-
-        # -------------------------
-        # Advanced-Mixers (Classification only)
-        # -------------------------
-        target_cls_soft = None
-        if use_mixer and task == "classification":
-            # one-hot soft target を mixer に渡す
-            y_one = F.one_hot(cls_labels, num_classes=num_classes).float()
-            try:
-                if getattr(mixer, "needs_bboxes", False):
-                    images, y_soft = mixer(images, y_one, bboxes)
-                else:
-                    images, y_soft = mixer(images, y_one)
-            except Exception as e:
-                logger.error(f"Mixer failed: {e}; skipping mixing this batch.")
-                y_soft = y_one  # フォールバック
-            target_cls_soft = y_soft  # 以後の loss/acc に使用
-
-        optimizer.zero_grad(set_to_none=True)
-
-        # -------------------------
-        # Forward & Loss (AMP)
-        # -------------------------
-        with torch.autocast(device_type=device.type):
-            output = model(images)
+            cls_labels = None
+            slope_targets = None
+            bboxes = None
 
             if task == "multitask":
-                # output: (signal_pred, slope_pred)
-                signal_pred, slope_pred = output
-                if (not torch.isfinite(signal_pred).all()) or (not torch.isfinite(slope_pred).all()):
-                    logger.warning("NaN/Inf detected in model output – skipping batch")
-                    continue
-                loss = loss_fn(signal_pred, cls_labels, slope_pred, slope_targets)
-                if not torch.isfinite(loss):
-                    logger.warning("NaN/Inf detected in loss – skipping batch")
-                    continue
+                cls_labels = to_dev(batch[1]); slope_targets = to_dev(batch[2])
+            elif task == "classification":
+                cls_labels = to_dev(batch[1])
+                if len(batch) > 2 and not torch.is_tensor(batch[2]):
+                    bboxes = batch[2]
+            elif task == "regression":
+                slope_targets = to_dev(batch[1])
+            else:  # segmentation
+                # segmentation の場合、get_dataloaders で (img, mask) にしている想定
+                images = to_dev(batch[0]); masks = to_dev(batch[1])
 
-                # accuracy for classification head
-                _, predicted = torch.max(signal_pred, 1)
-                correct += (predicted == cls_labels).sum().item()
-                total += cls_labels.size(0)
+            optimizer.zero_grad(set_to_none=True)
 
-            elif task == "segmentation":
-                images, masks = batch
-                images = to_dev(images); masks = to_dev(masks)
-                optimizer.zero_grad(set_to_none=True)
-                with torch.autocast(device_type=device.type):
+            with torch.autocast(device_type=device.type):
+                if task == "segmentation":
                     logits = model(images)  # [B,C,H,W]
                     if not torch.isfinite(logits).all():
-                        continue
+                        logger.warning("NaN/Inf in logits – skip batch"); continue
                     loss = F.cross_entropy(logits, masks, ignore_index=seg_ignore, weight=seg_weight)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer); scaler.update()
-                total_loss += float(loss.detach().item())
+                elif task == "multitask":
+                    signal_pred, slope_pred = model(images)
+                    if (not torch.isfinite(signal_pred).all()) or (not torch.isfinite(slope_pred).all()):
+                        logger.warning("NaN/Inf in output – skip batch"); continue
+                    loss = loss_fn(signal_pred, cls_labels, slope_pred, slope_targets)
+                elif task == "classification":
+                    if use_mixer:
+                        y_one = F.one_hot(cls_labels, num_classes=num_classes).float()
+                        try:
+                            if getattr(mixer, "needs_bboxes", False):
+                                images, y_soft = mixer(images, y_one, bboxes)
+                            else:
+                                images, y_soft = mixer(images, y_one)
+                        except Exception as e:
+                            logger.error(f"Mixer failed: {e}; use hard labels")
+                            y_soft = y_one
+                        logits = model(images)  # ★ Mix後の画像で再forward
+                        if not torch.isfinite(logits).all():
+                            logger.warning("NaN/Inf in logits – skip batch"); continue
+                        logp = F.log_softmax(logits, dim=1)
+                        loss = -(y_soft * logp).sum(dim=1).mean()
+                        hard_t = torch.argmax(y_soft, dim=1)
+                        correct += (logits.argmax(1) == hard_t).sum().item()
+                        total += hard_t.numel()
+                    else:
+                        logits = model(images)
+                        if not torch.isfinite(logits).all():
+                            logger.warning("NaN/Inf in logits – skip batch"); continue
+                        loss = loss_fn(logits, cls_labels)
+                        correct += (logits.argmax(1) == cls_labels).sum().item()
+                        total += cls_labels.numel()
+                else:  # regression
+                    out = model(images)
+                    if not torch.isfinite(out).all():
+                        logger.warning("NaN/Inf in output – skip batch"); continue
+                    loss = loss_fn(out, slope_targets)
 
-                # pixel-acc を学習中にも集計
-                preds = torch.argmax(logits, dim=1)
-                valid = (masks != seg_ignore)
-                correct += (preds[valid] == masks[valid]).sum().item()
-                total   += int(valid.sum().item())
-                continue
+            scaler.scale(loss).backward()
 
-            elif task == "classification":
-                if not torch.isfinite(output).all():
-                    logger.warning("NaN/Inf detected in output – skipping batch")
-                    continue
+            if ib == 0 and _is_main():
+                names = (model.module.named_parameters() if hasattr(model, "module") else model.named_parameters())
+                unused = [n for n, p in names if p.requires_grad and p.grad is None]
+                if unused:
+                    logger.warning(f"[GradCheck] Unused params in first iter (n={len(unused)}): {unused[:20]}{' ...' if len(unused)>20 else ''}")
+            scaler.step(optimizer); scaler.update()
+            total_loss += float(loss.detach().item())
 
-                if target_cls_soft is not None:
-                    # Soft cross-entropy: −Σ q log p
-                    logp = F.log_softmax(output, dim=1)
-                    loss = -(target_cls_soft * logp).sum(dim=1).mean()
-                    # accuracy は「現在のターゲット」に合わせる（mixer がラベルを書き換えるため）
-                    hard_targets_for_acc = torch.argmax(target_cls_soft, dim=1)
-                else:
-                    loss = loss_fn(output, cls_labels)
-                    hard_targets_for_acc = cls_labels
+            if ib == 0 and _is_main():
+                try:
+                    if task in ("classification","multitask","regression"):
+                        logger.info(f"[Batch0] images={tuple(images.shape)} dtype={images.dtype}")
+                    elif task == "segmentation":
+                        logger.info(f"[Batch0] images={tuple(images.shape)} masks={tuple(masks.shape)}")
+                except Exception:
+                    pass
 
-                if not torch.isfinite(loss):
-                    logger.warning("NaN/Inf detected in loss – skipping batch")
-                    continue
-
-                _, predicted = torch.max(output, 1)
-                correct += (predicted == hard_targets_for_acc).sum().item()
-                total += hard_targets_for_acc.size(0)
-
-            else:  # regression
-                if not torch.isfinite(output).all():
-                    logger.warning("NaN/Inf detected in regression output – skipping batch")
-                    continue
-                loss = loss_fn(output, slope_targets)
-                if not torch.isfinite(loss):
-                    logger.warning("NaN/Inf detected in loss – skipping batch")
-                    continue
-
-        # -------------------------
-        # Backward (AMP)
-        # -------------------------
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-
-        total_loss += float(loss.detach().item())
+        except Exception as e:
+            logger.exception(f"[Train] Exception at iter {ib}: {e}")
+            raise
 
     acc = (correct / total * 100.0) if (task != "regression" and total > 0) else 0.0
     denom = max(1, len(loader))
     return total_loss / denom, acc
 
-
-def validate_one_epoch(model, loader, loss_fn, device, task: str, logger):
-    """
-    - 評価時は mixer は使わず、従来どおり hard target で計測
-    - 既存のメトリクス構築（classification/regression/multitask）はそのまま
-    """
+def validate_one_epoch(model, loader, loss_fn, device, task: str, logger: logging.Logger):
     model.eval()
     total_loss, correct, total = 0.0, 0, 0
-    y_true_cls: List[int] = []
-    y_pred_cls: List[int] = []
-    y_prob_cls: List[np.ndarray] = []
-    y_true_reg: List[float] = []
-    y_pred_reg: List[float] = []
+    y_true_cls: List[int] = []; y_pred_cls: List[int] = []; y_prob_cls: List[np.ndarray] = []
+    y_true_reg: List[float] = []; y_pred_reg: List[float] = []
 
-    pbar_disable = not _is_main_process()
+    pbar_disable = not _is_main()
+    desc = f"Validating[R{_rank()}]"
 
-    # segmentation 評価用
-    seg_inter = None
-    seg_union = None
-
-    # CE 設定
-    seg_ignore = 255
-    seg_weight = None
+    # segmentation 集計
+    seg_inter = None; seg_union = None
+    seg_ignore = 255; seg_weight = None
 
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Validating", disable=pbar_disable):
-            def to_dev(x):
-                return x.to(device, non_blocking=True) if torch.is_tensor(x) else x
-
-            if isinstance(batch, (list, tuple)):
-                batch = list(batch)
-            else:
-                batch = [batch]
-
-            images = to_dev(batch[0])
-
-            # 2番目以降（タスク別）
-            cls_labels = None
-            slope_targets = None
-            if task == "multitask":
-                cls_labels = to_dev(batch[1])
-                slope_targets = to_dev(batch[2])
-            elif task == "classification":
-                cls_labels = to_dev(batch[1])
-            else:
-                slope_targets = to_dev(batch[1])
-
-            with torch.autocast(device_type=device.type):
-                output = model(images)
+        for ib, batch in enumerate(tqdm(loader, desc=desc, disable=pbar_disable)):
+            try:
+                def to_dev(x): return x.to(device, non_blocking=True) if torch.is_tensor(x) else x
+                if isinstance(batch, (list, tuple)): batch = list(batch)
+                images = to_dev(batch[0])
 
                 if task == "multitask":
-                    signal_pred, slope_pred = output
-                    if (not torch.isfinite(signal_pred).all()) or (not torch.isfinite(slope_pred).all()):
-                        logger.warning("NaN/Inf detected in output – skipping sample")
-                        continue
+                    cls_labels = to_dev(batch[1]); slope_targets = to_dev(batch[2])
+                    signal_pred, slope_pred = model(images)
                     loss = loss_fn(signal_pred, cls_labels, slope_pred, slope_targets)
-                    if not torch.isfinite(loss):
-                        logger.warning("NaN/Inf detected in loss – skipping sample")
-                        continue
-
-                    # collect classification metrics
                     y_true_cls.extend(cls_labels.cpu().tolist())
-                    y_pred_cls.extend(signal_pred.argmax(dim=1).cpu().tolist())
-                    y_prob_cls.extend(torch.softmax(signal_pred, dim=1).cpu().numpy())
-                    # collect regression metrics
+                    y_pred_cls.extend(signal_pred.argmax(1).cpu().tolist())
+                    y_prob_cls.extend(torch.softmax(signal_pred, 1).cpu().numpy())
                     y_true_reg.extend(slope_targets.cpu().tolist())
                     y_pred_reg.extend(torch.tanh(slope_pred).cpu().tolist())
-
-                    # accuracy for classification head
-                    _, predicted = torch.max(signal_pred, 1)
-                    correct += (predicted == cls_labels).sum().item()
-                    total += cls_labels.size(0)
+                    correct += (signal_pred.argmax(1) == cls_labels).sum().item()
+                    total += cls_labels.numel()
 
                 elif task == "classification":
-                    if not torch.isfinite(output).all():
-                        logger.warning("NaN/Inf detected in output – skipping sample")
-                        continue
-                    loss = loss_fn(output, cls_labels)
-                    if not torch.isfinite(loss):
-                        logger.warning("NaN/Inf detected in loss – skipping sample")
-                        continue
-                    if task == "segmentation":
-                        images, masks = batch
-                        images = to_dev(images); masks = to_dev(masks)
-                        with torch.autocast(device_type=device.type):
-                            logits = model(images)
-                            loss = F.cross_entropy(logits, masks, ignore_index=seg_ignore, weight=seg_weight)
-                        total_loss += float(loss.detach().item())
+                    logits = model(images); loss = loss_fn(logits, to_dev(batch[1]))
+                    y_true = to_dev(batch[1])
+                    y_true_cls.extend(y_true.cpu().tolist())
+                    y_pred_cls.extend(logits.argmax(1).cpu().tolist())
+                    y_prob_cls.extend(torch.softmax(logits, 1).cpu().numpy())
+                    correct += (logits.argmax(1) == y_true).sum().item()
+                    total += y_true.numel()
 
-                        preds = torch.argmax(logits, dim=1)
-                        valid = (masks != seg_ignore)
-                        correct += (preds[valid] == masks[valid]).sum().item()
-                        total   += int(valid.sum().item())
-
-                        # IoU 集計
-                        num_classes = logits.shape[1]
-                        preds_np = preds.cpu().numpy()
-                        masks_np = masks.cpu().numpy()
-                        for c in range(num_classes):
-                            if c == seg_ignore: continue
-                            pred_c = (preds_np == c)
-                            mask_c = (masks_np == c)
-                            inter = (pred_c & mask_c).sum()
-                            union = (pred_c | mask_c).sum()
-                            if seg_inter is None:
-                                seg_inter = np.zeros(num_classes, dtype=np.int64)
-                                seg_union = np.zeros(num_classes, dtype=np.int64)
-                            seg_inter[c] += inter
-                            seg_union[c] += union
-                        continue
-
-
-                    y_true_cls.extend(cls_labels.cpu().tolist())
-                    y_pred_cls.extend(output.argmax(dim=1).cpu().tolist())
-                    y_prob_cls.extend(torch.softmax(output, dim=1).cpu().numpy())
-
-                    _, predicted = torch.max(output, 1)
-                    correct += (predicted == cls_labels).sum().item()
-                    total += cls_labels.size(0)
+                elif task == "segmentation":
+                    images = to_dev(batch[0]); masks = to_dev(batch[1])
+                    logits = model(images); loss = F.cross_entropy(logits, masks, ignore_index=seg_ignore, weight=seg_weight)
+                    preds = logits.argmax(1); valid = (masks != seg_ignore)
+                    correct += (preds[valid] == masks[valid]).sum().item(); total += int(valid.sum().item())
+                    # IoU
+                    num_classes = logits.shape[1]
+                    pnp = preds.cpu().numpy(); mnp = masks.cpu().numpy()
+                    for c in range(num_classes):
+                        inter = ((pnp == c) & (mnp == c)).sum()
+                        union = ((pnp == c) | (mnp == c)).sum()
+                        if seg_inter is None:
+                            seg_inter = np.zeros(num_classes, np.int64); seg_union = np.zeros(num_classes, np.int64)
+                        seg_inter[c] += inter; seg_union[c] += union
 
                 else:  # regression
-                    if not torch.isfinite(output).all():
-                        logger.warning("NaN/Inf detected in output – skipping sample")
-                        continue
-                    loss = loss_fn(output, slope_targets)
-                    if not torch.isfinite(loss):
-                        logger.warning("NaN/Inf detected in loss – skipping sample")
-                        continue
+                    out = model(images); loss = loss_fn(out, to_dev(batch[1]))
+                    y_true_reg.extend(to_dev(batch[1]).cpu().tolist())
+                    y_pred_reg.extend(torch.tanh(out).cpu().tolist())
 
-                    y_true_reg.extend(slope_targets.cpu().tolist())
-                    y_pred_reg.extend(torch.tanh(output).cpu().tolist())
+                total_loss += float(loss.detach().item())
 
-            total_loss += float(loss.detach().item())
+            except Exception as e:
+                logger.exception(f"[Val] Exception at iter {ib}: {e}")
+                raise
 
-    # Accuracy (classification / multitask のみ)
     acc = (correct / total * 100.0) if (task != "regression" and total > 0) else 0.0
-
-    # ---- build metrics dict（既存の evaluate_* をそのまま使用）----
-    metrics: Dict[str, Any] = {}
     if task == "classification":
+        metrics = {}
         if len(set(y_true_cls)) >= 2:
             metrics = evaluate_classification(y_true_cls, y_pred_cls, np.array(y_prob_cls), num_classes=3)
-    elif task == "regression":
+        return total_loss / max(1, len(loader)), acc, metrics
+    if task == "regression":
         metrics = evaluate_regression(y_true_reg, y_pred_reg)
-    elif task == "segmentation":
-        pix_acc = (correct / total * 100.0) if total > 0 else 0.0
-        miou = 0.0
-        per_class_iou = {}
+        return total_loss / max(1, len(loader)), 0.0, metrics
+    if task == "segmentation":
+        pix_acc = acc
+        miou = 0.0; per_class_iou = {}
         if seg_inter is not None and seg_union is not None:
             iou = np.divide(seg_inter, np.maximum(1, seg_union), dtype=np.float64)
             valid_cls = [i for i in range(len(iou)) if seg_union[i] > 0]
             miou = float(iou[valid_cls].mean()) if valid_cls else 0.0
             per_class_iou = {f"class_{i}_iou": float(iou[i]) for i in valid_cls}
-
-        denom = max(1, len(loader))
         metrics = {"pixel_acc": pix_acc, "miou": miou, **per_class_iou}
-        return total_loss / denom, pix_acc, metrics
-    else:  # multitask
-        cls_metrics = {}
-        if len(set(y_true_cls)) >= 2:
-            cls_metrics = evaluate_classification(y_true_cls, y_pred_cls, np.array(y_prob_cls), num_classes=3)
-        reg_metrics = evaluate_regression(y_true_reg, y_pred_reg)
-        metrics = {"classification": cls_metrics, "regression": reg_metrics}
+        return total_loss / max(1, len(loader)), pix_acc, metrics
+    # multitask
+    cls_metrics = {}
+    if len(set(y_true_cls)) >= 2:
+        cls_metrics = evaluate_classification(y_true_cls, y_pred_cls, np.array(y_prob_cls), num_classes=3)
+    reg_metrics = evaluate_regression(y_true_reg, y_pred_reg)
+    return total_loss / max(1, len(loader)), acc, {"classification": cls_metrics, "regression": reg_metrics}
 
-    denom = max(1, len(loader))
-    return total_loss / denom, acc, metrics
 
 # -------------------------------------------------
 # Main worker
 # -------------------------------------------------
-
 def main_worker(rank: int, world_size: int):
-    """Entry point for each DDP process."""
-
-    # ---------------- logger ----------------
+    # ---- logger ----
     logging.basicConfig(
         level=logging.INFO if rank == 0 else logging.WARNING,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+        format=f"%(asctime)s [R{rank}] [%(levelname)s] %(message)s",
         handlers=[logging.StreamHandler()],
     )
     logger = logging.getLogger(__name__)
 
-    setup_ddp(rank, world_size)
-    device = torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
+    try:
+        setup_ddp(rank, world_size)
+        device = torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
+        _env_sanity_log(logger)
 
-    yaml_path = os.environ.get("TRAIN_CONFIG_PATH", "training_setting.yaml")
-    configs = load_all_training_configs(yaml_path)
+        yaml_path = os.environ.get("TRAIN_CONFIG_PATH", "training_setting.yaml")
+        if _is_main():
+            logger.info(f"[CFG] YAML: {yaml_path}")
 
-    for cfg in configs:
-        # ----------------‑ wandb init (rank 0 only) ----------------
-        time_tag = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_name = f"{cfg.run_prefix}.{cfg.model_name}.{time_tag}"
+        configs = load_all_training_configs(yaml_path)
+        if _is_main():
+            logger.info(f"[CFG] parsed {len(configs)} model entries")
 
-        if rank == 0:
-            run = wandb.init(
-                project=cfg.wandb_project,   # ← ここが可変に
-                name=run_name,
-                config={
-                    "task": cfg.task,
-                    "model_name": cfg.model_name,
-                    # 必要なら他のcfgも記録
-                },
-                reinit=True,
+        for cfg in configs:
+            # ---- wandb (rank0 only) ----
+            time_tag = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_name = f"{cfg.run_prefix}.{cfg.model_name}.{time_tag}"
+            if rank == 0:
+                run = wandb.init(
+                    project=cfg.wandb_project,
+                    name=run_name,
+                    config={"task": cfg.task, "model_name": cfg.model_name},
+                    reinit=True,
+                )
+                logger.info("wandb run initialised")
+
+            # ---- model ----
+            logger.info(f"[Model] building {cfg.model_name} (task={cfg.task})")
+            if str(cfg.task).lower() == "segmentation":
+                model = create_segmentation_model(
+                    cfg.model_name,
+                    num_classes=int(getattr(cfg, "num_classes", 2)),
+                    dropout_rate=cfg.dropout_rate,
+                    drop_path_rate=cfg.drop_path_rate,
+                ).to(device)
+            else:
+                model = get_model(
+                    cfg.task,
+                    cfg.model_name,
+                    num_classes=int(getattr(cfg, "num_classes", 3)),
+                    dropout_rate=cfg.dropout_rate,
+                    drop_path_rate=cfg.drop_path_rate,
+                    cfg=cfg
+                ).to(device)
+
+            model = DDP(
+                model,
+                device_ids=[rank] if device.type == "cuda" else None,
+                find_unused_parameters=False,         # 未使用パラメータ許可＆検知
+                gradient_as_bucket_view=True,         # 軽微な最適化
+                static_graph=False                    # 動的分岐の可能性に備える
             )
-            # Watch gradients & params (optional)
-            # wandb.watch(
-            #     None,  # we will set later when model is ready
-            #     log="gradients",
-            #     log_freq=100,
-            # )
-            logger.info("wandb run initialised")
+            if _is_main():
+                logger.info("[DDP] find_unused_parameters=True / static_graph=False")
+            if rank == 0:
+                wandb.watch(model.module if hasattr(model, "module") else model)
 
-        # ---------- model ----------
-        t0 = time.time()
-        logger.info(f"[R{rank}] Loading model {cfg.model_name} …")
-        if str(cfg.task).lower() == "segmentation":
-            model = create_segmentation_model(  # ← segmentation は専用factoryで
-                cfg.model_name,
-                num_classes=int(getattr(cfg, "num_classes", 2)),
-                dropout_rate=cfg.dropout_rate,
-                drop_path_rate=cfg.drop_path_rate,
-            ).to(device)
-        else:
-            model = get_model(
-                cfg.task,
-                cfg.model_name,
-                num_classes=int(getattr(cfg, "num_classes", 3)),  # ← 固定3を修正
-                dropout_rate=cfg.dropout_rate,
-                drop_path_rate=cfg.drop_path_rate,
-            ).to(device)
+            # ---- data ----
+            logger.info("[Data] building dataloaders …")
+            train_loader, valid_loader, train_sampler = get_dataloaders(cfg, rank, world_size, logger)
 
-        model = DDP(model, device_ids=[rank])
-        if rank == 0:
-            wandb.watch(model.module)
+            # ---- 事前プローブ: 最初の1バッチを rank0 で確認（形・dtype をログ）----
+            if _is_main():
+                try:
+                    logger.info("[Probe] fetching first train batch …")
+                    _it = iter(train_loader)
+                    b = next(_it)  # DataLoader.timeout により最大120秒で例外
+                    if isinstance(b, (list, tuple)):
+                        x = b[0]
+                    else:
+                        x = b
+                    if torch.is_tensor(x):
+                        logger.info(f"[Probe] OK: batch0 images={tuple(x.shape)} dtype={x.dtype}")
+                    else:
+                        logger.info(f"[Probe] OK: batch0 type={type(x)}")
+                    del _it, b, x
+                except Exception as e:
+                    logger.exception(f"[Probe] FAILED to get first batch: {e}")
+                    raise
 
-        # ---------- data ----------
-        train_loader, valid_loader, train_sampler = get_dataloaders(cfg, rank, world_size)
+            # ---- mixer / optim / loss ----
+            mixer = None if str(cfg.task).lower()=="segmentation" else get_mixer(cfg.AUGMENTATION, backbone=model.module if hasattr(model,"module") else model)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+            scaler = GradScaler('cuda', enabled=(device.type=="cuda"))
+            loss_fn = get_loss_fn(cfg.LOSS, task=cfg.task, class_counts=getattr(train_loader.dataset, "class_counts", None))
+            if hasattr(loss_fn, "to"): loss_fn = loss_fn.to(device)
 
-        # ---------- Advanced Mixer ----------
-        mixer = None if str(cfg.task).lower()=="segmentation" else get_mixer(cfg.AUGMENTATION, backbone=model.module)
+            # ---- logging / dirs (rank0) ----
+            if _is_main():
+                os.makedirs(cfg.save_path, exist_ok=True)
+                os.makedirs(cfg.result_path, exist_ok=True)
+                writer = SummaryWriter(log_dir=os.path.join(cfg.result_path, "tensorboard", cfg.model_name))
 
-        # ---------- optimizer / loss ----------
-        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-        scaler = torch.amp.GradScaler('cuda' if device.type == 'cuda' else 'cpu')
-        loss_fn = get_loss_fn(cfg.LOSS, task=cfg.task, class_counts=getattr(train_loader.dataset, "class_counts", None))
-        if hasattr(loss_fn, "to"): loss_fn = loss_fn.to(device)
+            early_stopper = EarlyStopping(patience=cfg.patience, min_delta=cfg.min_delta)
+            best_val_acc = -1.0
+            result_log: List[List[Any]] = []
 
-        # ---------- logging ----------
-        if rank == 0:
-            os.makedirs(cfg.save_path, exist_ok=True)
-            os.makedirs(cfg.result_path, exist_ok=True)
-            writer = SummaryWriter(log_dir=os.path.join(cfg.result_path, "tensorboard", cfg.model_name))
-
-        # ---------- early stopping ----------
-        early_stopper = EarlyStopping(patience=cfg.patience, min_delta=cfg.min_delta)
-
-        best_val_loss = float("inf")
-        best_val_acc  = -1.0
-        best_ckpt_path = None
-        result_log = []
-
-        for epoch in range(cfg.epochs):
-            if train_sampler is not None:
+            for epoch in range(cfg.epochs):
                 train_sampler.set_epoch(epoch)
 
-            # ----- train -----
-            tr_loss, tr_acc = train_one_epoch(
-                model,
-                train_loader,
-                optimizer,
-                scaler,
-                loss_fn,
-                device,
-                cfg.task,
-                mixer=mixer,
-                num_classes=train_loader.dataset.num_classes,
-                cfg=cfg,
-                logger=logger,
-            )
-
-            # ----- validation (rank 0 only) -----
-            if rank == 0:
-                va_loss, va_acc, va_metrics = validate_one_epoch(model.module, valid_loader, loss_fn, device, cfg.task, logger)
-                early_stopper.step(va_loss)
-            else:
-                va_loss, va_acc, va_metrics = 0.0, 0.0, {}
-
-            # ----- early‑stop flag sync -----
-            stop_tensor = torch.tensor([1 if (rank == 0 and early_stopper.early_stop) else 0], dtype=torch.int, device=device)
-            dist.broadcast(stop_tensor, src=0)
-
-            # ----- rank 0: logging -----
-            if rank == 0:
-                logger.info(
-                    f"[{cfg.model_name}] epoch {epoch + 1}/{cfg.epochs} | "
-                    f"train {tr_loss:.4f}/{tr_acc:.2f}% | val {va_loss:.4f}/{va_acc:.2f}%"
+                tr_loss, tr_acc = train_one_epoch(
+                    model, train_loader, optimizer, scaler, loss_fn, device,
+                    cfg.task, mixer, getattr(train_loader.dataset, "num_classes", 3), cfg, logger
                 )
 
-                # summary for CSV
-                result_log.append([epoch + 1, tr_loss, va_loss, tr_acc, va_acc])
-                # TensorBoard
-                write_tensorboard(writer, epoch + 1, tr_loss, va_loss, tr_acc, va_acc, va_metrics, cfg.task)
+                if _is_main():
+                    va_loss, va_acc, va_metrics = validate_one_epoch(
+                        model.module if hasattr(model,"module") else model,
+                        valid_loader, loss_fn, device, cfg.task, logger
+                    )
+                    early_stopper.step(va_loss)
+                else:
+                    va_loss, va_acc, va_metrics = 0.0, 0.0, {}
 
-                # wandb
-                log_data = {
-                    "epoch": epoch + 1,
-                    "train/loss": tr_loss,
-                    "train/acc": tr_acc,
-                    "val/loss": va_loss,
-                    "val/acc": va_acc,
-                }
-                if str(cfg.task).lower() == "segmentation" and va_metrics:
-                    for k in ["pixel_acc","miou"]:
-                        if k in va_metrics: log_data[f"val/{k}"] = va_metrics[k]
-                if cfg.task in ["classification", "multitask"] and va_metrics:
-                    cls = va_metrics["classification"] if cfg.task == "multitask" else va_metrics
-                    for k in ["macro_f1", "micro_f1", "cohen_kappa", "mcc"]:
-                        if k in cls and cls[k] is not None:
-                            log_data[f"val/{k}"] = cls[k]
-                if cfg.task in ["regression", "multitask"] and va_metrics:
-                    reg = va_metrics["regression"] if cfg.task == "multitask" else va_metrics
-                    for k in ["rmse", "mae"]:
-                        if k in reg and reg[k] is not None:
-                            log_data[f"val/{k}"] = reg[k]
-                wandb.log(log_data)
+                # sync stop flag
+                stop_tensor = torch.tensor([1 if (_is_main() and early_stopper.early_stop) else 0],
+                                           dtype=torch.int, device=device)
+                dist.broadcast(stop_tensor, src=0)
 
-                # best checkpoint
-                if va_acc > best_val_acc:
-                    best_val_acc = va_acc
-                    ckpt_name = f"{cfg.run_prefix}.{cfg.model_name}.e{epoch:03d}.acc{va_acc:.2f}.pth"
-                    best_path = os.path.join(cfg.save_path, ckpt_name)
-                    torch.save(model.module.state_dict(), best_path)
-                    # save to wandb artifact
-                    artifact = wandb.Artifact(f"{cfg.run_prefix}", type="model")
-                    artifact.add_file(best_path)
-                    wandb.log_artifact(artifact)
-                    wandb.run.summary["best_val_acc"] = best_val_acc
-                    os.remove(best_path)
+                if _is_main():
+                    logger.info(
+                        f"[{cfg.model_name}] epoch {epoch+1}/{cfg.epochs} | "
+                        f"train {tr_loss:.4f}/{tr_acc:.2f}% | val {va_loss:.4f}/{va_acc:.2f}%"
+                    )
+                    result_log.append([epoch+1, tr_loss, va_loss, tr_acc, va_acc])
 
-            # ----- early stopping -----
-            if stop_tensor.item():
-                if rank == 0:
-                    logger.info(f"Early stopping triggered at epoch {epoch + 1}")
-                break
+                    log_data = {"epoch": epoch+1, "train/loss": tr_loss, "train/acc": tr_acc,
+                                "val/loss": va_loss, "val/acc": va_acc}
+                    if str(cfg.task).lower() == "segmentation" and va_metrics:
+                        for k in ["pixel_acc","miou"]:
+                            if k in va_metrics: log_data[f"val/{k}"] = va_metrics[k]
+                    if cfg.task in ["classification","multitask"] and va_metrics:
+                        cls = va_metrics["classification"] if cfg.task == "multitask" else va_metrics
+                        for k in ["macro_f1","micro_f1","cohen_kappa","mcc"]:
+                            if k in cls and cls[k] is not None:
+                                log_data[f"val/{k}"] = cls[k]
+                    if cfg.task in ["regression","multitask"] and va_metrics:
+                        reg = va_metrics["regression"] if cfg.task == "multitask" else va_metrics
+                        for k in ["rmse","mae"]:
+                            if k in reg and reg[k] is not None:
+                                log_data[f"val/{k}"] = reg[k]
+                    wandb.log(log_data)
 
-        # ---------- rank 0: CSV output ----------
-        if rank == 0:
-            df = pd.DataFrame(result_log, columns=["epoch", "train_loss", "val_loss", "train_acc", "val_acc"])
-            csv_path = os.path.join(cfg.result_path, f"{cfg.model_name}_result.csv")
-            df.to_csv(csv_path, index=False)
-            wandb.save(csv_path)
-            writer.close()
+                    if va_acc > best_val_acc:
+                        best_val_acc = va_acc
+                        ckpt_name = f"{cfg.run_prefix}.{cfg.model_name}.e{epoch:03d}.acc{va_acc:.2f}.pth"
+                        best_path = os.path.join(cfg.save_path, ckpt_name)
+                        torch.save((model.module if hasattr(model,"module") else model).state_dict(), best_path)
+                        artifact = wandb.Artifact(f"{cfg.run_prefix}", type="model")
+                        artifact.add_file(best_path)
+                        wandb.log_artifact(artifact)
+                        wandb.run.summary["best_val_acc"] = best_val_acc
+                        os.remove(best_path)
+
+                if stop_tensor.item():
+                    if _is_main():
+                        logger.info(f"Early stopping at epoch {epoch+1}")
+                    break
+
+            # ---- rank0: CSV / finish ----
+            if _is_main():
+                df = pd.DataFrame(result_log, columns=["epoch","train_loss","val_loss","train_acc","val_acc"])
+                csv_path = os.path.join(cfg.result_path, f"{cfg.model_name}_result.csv")
+                df.to_csv(csv_path, index=False)
+                wandb.save(csv_path)
+                writer.close()
+                wandb.finish()
+
+            dist.barrier()
+            free_gpu_memory(model)
+
+    except KeyboardInterrupt:
+        if _is_main():
+            logging.getLogger(__name__).warning("KeyboardInterrupt received. Cleaning up …")
+        try:
             wandb.finish()
-
-        dist.barrier()
-        torch.cuda.empty_cache()
-
-    cleanup_ddp()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        logging.getLogger(__name__).exception(f"Fatal error: {e}")
+        try:
+            wandb.finish()
+        except Exception:
+            pass
+        raise
+    finally:
+        cleanup_ddp()
+        free_gpu_memory()
