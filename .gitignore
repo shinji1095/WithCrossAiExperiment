@@ -9,6 +9,11 @@ src/mixer/__pycache__/
 src/models/__pycache__/
 src/models/*/__pycache__/
 src/models/*/**/__pycache__/
+*/__pycache__/
+*/**/__pycache__/
+*/**/***/__pycache__/
+*/**/***/****/__pycache__/
+
 
 src/utils/__pycache__/
 src/convert/__pycache__/
