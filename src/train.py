@@ -2,7 +2,7 @@ import os
 import torch
 import torch.multiprocessing as mp
 import argparse
-from train_ddp import main_worker
+from _train_ddp import main_worker
 
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 

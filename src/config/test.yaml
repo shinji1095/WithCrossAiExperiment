@@ -42,15 +42,22 @@ experiment:
     label_smoothing: 0.3
 
   models:
-    - name: edgenext_base.s_bn_hs   
-      image_size: [320, 320]                   
-    - name: edgenext_base.s_bn_hs_hr   
-      image_size: [320, 320]    
-    - name: edgenext_base.s_bn_hs_hr   
-      image_size: [320, 320]     
-    - name: edgenext_base.b_tanh   
-      image_size: [320, 320]     
-    - name: edgenext_base.b_tanh_hr   
-      image_size: [320, 320]   
-    - name: edgenext_base.b_tanh_hr_cdw  
-      image_size: [320, 320]   
+    - name: tf_efficientnet_b3.ns_jft_in1k   
+      image_size: [300, 300]             
+    - name: mobilenetv4_hybrid_medium.e200_r256_in12k_ft_in1k
+      image_size: [320, 320]          
+    - name: tiny_vit_11m_224.dist_in22k_ft_in1k
+      image_size: [224, 224]        
+    - name: tf_efficientnet_b2.ns_jft_in1k
+      image_size: [260, 260]          
+    - name: hgnetv2_b3.ssld_stage2_ft_in1k
+      image_size: [288, 288] 
+    - name: mobilenetv4_hybrid_medium.ix_e550_r256_in1k
+      image_size: [320, 320]             
+    - name: tf_efficientnet_b4.ns_jft_in1k
+      image_size: [380, 380]          
+    - name: hgnetv2_b2.ssld_stage2_ft_in1k
+      image_size: [288, 288]        
+    - name: tiny_vit_21m_224.dist_in22k_ft_in1k
+      image_size: [224, 224]          
+                    

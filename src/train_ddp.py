@@ -586,7 +586,7 @@ def main_worker(rank: int, world_size: int):
                         ckpt_name = f"{cfg.run_prefix}.{cfg.model_name}.e{epoch:03d}.acc{va_acc:.2f}.pth"
                         best_path = os.path.join(cfg.save_path, ckpt_name)
                         torch.save((model.module if hasattr(model,"module") else model).state_dict(), best_path)
-                        artifact = wandb.Artifact(f"{cfg.run_prefix}", type="model")
+                        artifact = wandb.Artifact(f"{cfg.run_prefix}.{cfg.model_name}", type="model")
                         artifact.add_file(best_path)
                         wandb.log_artifact(artifact)
                         wandb.run.summary["best_val_acc"] = best_val_acc

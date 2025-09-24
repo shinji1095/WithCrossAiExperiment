@@ -1,15 +1,75 @@
 import cv2
-import torch
-import pandas as pd
-import numpy as np
-from pathlib import Path
-from torch.utils.data import Dataset
 import json
-
+import torch
+import random
 import logging
+import numpy as np
+import pandas as pd
+import albumentations as A
 
-# logger を用意
+from pathlib import Path
+from typing import Tuple, Optional
+from torch.utils.data import Dataset
+from albumentations.pytorch import ToTensorV2
+
 logger = logging.getLogger(__name__)
+
+class SimpleTransform:
+    """
+    - Optional resize to (H,W)
+    - ToTensor (CHW, float32, 0..1)
+    - Normalize: (x-mean)/std
+    SignalMixClassificationDataset が期待する .base_transform(image=...) を提供。
+    """
+    def __init__(self, size_hw: Optional[Tuple[int,int]]=None, mean=0.5, std=0.5):
+        self.size_hw = tuple(size_hw) if size_hw is not None else None
+        self.mean = float(mean); self.std = float(std)
+
+    def base_transform(self, image):
+        import cv2, torch
+        if self.size_hw is not None:
+            H, W = self.size_hw
+            image = cv2.resize(image, (W, H), interpolation=cv2.INTER_LINEAR)
+        t = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+        t = (t - self.mean) / self.std
+        return {"image": t}
+
+class AlbumentationTransform:
+    def __init__(self, size_hw=(224, 224)):
+        self.size_hw = size_hw
+        self.base_transform = A.Compose([
+            A.Resize(*size_hw),
+            A.HorizontalFlip(p=0.5),
+            A.RandomBrightnessContrast(p=0.5),
+            A.HueSaturationValue(p=0.5),
+            A.Rotate(limit=15, border_mode=cv2.BORDER_CONSTANT, p=0.8),
+            # A.MotionBlur(blur_limit=(3, 7), p=0.3),  
+            # A.GaussNoise(std_range=(0.1, 0.2), p=0.3),  
+            # A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.5), p=0.3),  
+            A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+            ToTensorV2()
+        ])
+
+    def __call__(self, image_np, slope_deg):
+        angle = 0.0
+        flipped = False
+
+        rotate_transform = A.Rotate(limit=15, border_mode=cv2.BORDER_CONSTANT, p=1.0)
+        rotated = rotate_transform(image=image_np)
+        angle = rotate_transform.params.get('angle', 0.0)
+        image_np = rotated['image']
+
+        if random.random() < 0.5:
+            image_np = cv2.flip(image_np, 1)
+            flipped = True
+            slope_deg = -slope_deg
+
+        slope_deg -= angle  # 傾き補正（時計回りが正）
+
+        transformed = self.base_transform(image=image_np)
+        image_tensor = transformed['image']
+
+        return image_tensor, slope_deg
 
 class SignalSlopeDataset(Dataset):
     def __init__(self, csv_path, image_dir, task='multitask', transform=None, state_filter=None, shuffle=False):

@@ -4,7 +4,7 @@ experiment:
   epochs:         300
   batch_size:     32
   image_size:     [224, 224]
-  learning_rate:  5e-4
+  learning_rate:  5e-5
   weight_decay:   0.05
   patience:       30
   min_delta:      1e-5
@@ -37,7 +37,7 @@ experiment:
     signal_dir: D:\Datasets\WithCross Dataset\vidvip_signal/signal
     signal_csv: D:\Datasets\WithCross Dataset\vidvip_signal/signal.csv
     none_index: 0
-    transform : albumentation # simple / albumentation
+    transform : simple # simple / albumentation
 
   LOSS:
     name: "focal"      # "ce" / "weighted_ce" / "focal"
